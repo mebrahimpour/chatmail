@@ -1,0 +1,12 @@
+# Compiled binary
+/chatmail
+chatmail
+
+# Bbolt database files / local data
+*.db
+/data/
+/var/
+
+# Editor / OS noise
+*.swp
+.DS_Store
