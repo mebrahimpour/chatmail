@@ -1,0 +1,47 @@
+[Unit]
+Description=Minimal Chatmail Server (SMTP + IMAP over plaintext loopback)
+Documentation=https://github.com/mebrahimpour/chatmail
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/chatmail \
+    --domain local.chat \
+    --data-dir /var/lib/chatmail \
+    --smtp-addr 127.0.0.1:1025 \
+    --imap-addr 127.0.0.1:1143
+Restart=on-failure
+RestartSec=2
+
+# Run as a dedicated unprivileged user (create with: useradd --system --no-create-home chatmail)
+User=chatmail
+Group=chatmail
+
+# --- Sandbox profile (Section 5.2) ---
+# Restrict system file access
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/
+
+# Allow write access only to the dedicated data directory
+ReadWritePaths=/var/lib/chatmail/
+StateDirectory=chatmail
+
+# Network layer restrictions
+PrivateTmp=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Kernel and privilege isolation
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
