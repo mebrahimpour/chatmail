@@ -1,6 +1,5 @@
-# Compiled binary
+# Compiled binary (root only; do not ignore cmd/chatmail/ source dir)
 /chatmail
-chatmail
 
 # Bbolt database files / local data
 *.db
