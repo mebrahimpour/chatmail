@@ -44,9 +44,7 @@ deploy/stunnel.conf          stunnel4 TLS-termination config
 ## Build & run
 
 ```sh
-go build -o chatmail ./cmd/chatmail
-./chatmail --domain local.chat --data-dir ./data \
-    --smtp-addr 127.0.0.1:1025 --imap-addr 127.0.0.1:1143
+make build
 ```
 
 Flags (all optional, defaults shown):
@@ -63,8 +61,11 @@ Flags (all optional, defaults shown):
 ## Tests
 
 ```sh
-go test ./...                 # Go unit tests (storage layer)
-go build -o chatmail ./cmd/chatmail && python3 integration_test.py
+make test
+make race
+make fuzz
+make bench
+python3 integration_test.py
 ```
 
 The integration suite covers the design's Validation Checkpoints: SMTP
@@ -76,13 +77,12 @@ round-trip that verifies the stored payload is byte-identical.
 
 1. Install the binary at `/usr/local/bin/chatmail` and create the service user:
    ```sh
-   sudo useradd --system --no-create-home chatmail
-   sudo install -m755 chatmail /usr/local/bin/chatmail
+    sudo make install
    ```
 2. Install the systemd unit and start it:
    ```sh
-   sudo cp deploy/chatmail.service /etc/systemd/system/
-   sudo systemctl enable --now chatmail
+    sudo cp deploy/chatmail.service /etc/systemd/system/
+    sudo systemctl enable --now chatmail
    ```
 3. Generate a self-signed cert and configure stunnel4 (see comments in
    `deploy/stunnel.conf`), then point DeltaChat at ports 587 (SMTP) and 993

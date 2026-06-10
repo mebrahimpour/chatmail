@@ -1,6 +1,10 @@
 // Package smtp implements the chatmail SMTP submission engine on top of
 // emersion/go-smtp. It performs auto-registration on first authentication,
 // enforces the local-domain policy, and commits raw MIME payloads to bbolt.
+//
+// TLS is intentionally absent: transport encryption is terminated by the
+// external stunnel4 daemon, so this engine speaks plaintext on its loopback
+// port only.
 package smtp
 
 import (
@@ -12,11 +16,12 @@ import (
 	"github.com/emersion/go-sasl"
 	gosmtp "github.com/emersion/go-smtp"
 
-	"github.com/local/chatmail/internal/database"
+	"chatmail/internal/database"
 )
 
 // MaxMessageBytes is the maximum accepted DATA payload (10 MiB). Larger
-// submissions are rejected with a 552 error during the DATA phase.
+// submissions are rejected with 552 either pre-emptively in MAIL (if the
+// client advertises SIZE) or by the framework during DATA.
 const MaxMessageBytes int64 = 10 * 1024 * 1024
 
 // Backend adapts the chatmail database to the go-smtp Backend interface.
@@ -25,9 +30,10 @@ type Backend struct {
 	logger *log.Logger
 }
 
-// NewServer constructs a go-smtp server bound to addr. TLS is intentionally not
-// configured: transport encryption is terminated by the external stunnel4
-// daemon, so the engine speaks plaintext on its loopback port.
+// Compile-time interface check.
+var _ gosmtp.Backend = (*Backend)(nil)
+
+// NewServer constructs a configured go-smtp server bound to addr.
 func NewServer(db *database.DB, addr string, logger *log.Logger) *gosmtp.Server {
 	be := &Backend{db: db, logger: logger}
 	s := gosmtp.NewServer(be)
@@ -35,11 +41,14 @@ func NewServer(db *database.DB, addr string, logger *log.Logger) *gosmtp.Server 
 	s.Domain = db.Domain()
 	s.MaxMessageBytes = MaxMessageBytes
 	s.MaxRecipients = 50
+	// Standard SMTP timeout for submission servers.
+	// RFC 5321 §4.5.3.2 recommends 5 minutes for DATA; we use that for all phases.
 	s.ReadTimeout = 5 * time.Minute
 	s.WriteTimeout = 5 * time.Minute
-	// The engine runs behind stunnel4 on a plaintext loopback socket, so AUTH
-	// must be offered without an in-process TLS layer.
+	// AUTH must be offered on this plain loopback socket because stunnel4 has
+	// already terminated TLS on the public-facing port.
 	s.AllowInsecureAuth = true
+	// Accept UTF-8 in addresses (RFC 6532) for international usernames.
 	s.EnableSMTPUTF8 = true
 	if logger != nil {
 		s.ErrorLog = logger
@@ -57,14 +66,15 @@ type session struct {
 	db     *database.DB
 	logger *log.Logger
 
-	authUser string
+	authUser string // set after successful AUTH PLAIN
 	from     string
 	rcpts    []string
 }
 
+// Compile-time interface check.
 var _ gosmtp.AuthSession = (*session)(nil)
 
-// AuthMechanisms advertises the supported SASL mechanisms.
+// AuthMechanisms advertises supported SASL mechanisms.
 func (s *session) AuthMechanisms() []string {
 	return []string{sasl.Plain}
 }
@@ -86,7 +96,7 @@ func (s *session) Auth(mech string) (sasl.Server, error) {
 			return &gosmtp.SMTPError{
 				Code:         451,
 				EnhancedCode: gosmtp.EnhancedCode{4, 0, 0},
-				Message:      "Internal authentication error",
+				Message:      "Internal authentication error; please retry",
 			}
 		}
 		s.authUser = username
@@ -97,8 +107,21 @@ func (s *session) Auth(mech string) (sasl.Server, error) {
 	}), nil
 }
 
-// Mail validates the envelope sender domain against the local server domain.
-func (s *session) Mail(from string, _ *gosmtp.MailOptions) error {
+// Mail validates the envelope sender.
+//
+// Enforced invariants:
+//  1. The client must be authenticated (530).
+//  2. The sender domain must match the local server domain (550).
+//  3. If the client declared SIZE > MaxMessageBytes in EHLO, reject early (552).
+func (s *session) Mail(from string, opts *gosmtp.MailOptions) error {
+	if s.authUser == "" {
+		// RFC 4954 §4 requires 530 "Authentication required" here.
+		return &gosmtp.SMTPError{
+			Code:         530,
+			EnhancedCode: gosmtp.EnhancedCode{5, 7, 0},
+			Message:      "Authentication required",
+		}
+	}
 	if !s.domainMatches(from) {
 		return &gosmtp.SMTPError{
 			Code:         550,
@@ -106,13 +129,22 @@ func (s *session) Mail(from string, _ *gosmtp.MailOptions) error {
 			Message:      "Access denied: sender domain is not local",
 		}
 	}
+	// Pre-emptive SIZE check (RFC 1870): reject before the client wastes
+	// bandwidth uploading an oversized message.
+	if opts != nil && opts.Size > MaxMessageBytes {
+		return &gosmtp.SMTPError{
+			Code:         552,
+			EnhancedCode: gosmtp.EnhancedCode{5, 3, 4},
+			Message:      "Message size exceeds maximum",
+		}
+	}
 	s.from = from
 	return nil
 }
 
-// Rcpt enforces that the recipient is local; external relay is refused. Local
-// recipient mailboxes are provisioned on demand so messages can be delivered
-// even before the recipient first authenticates.
+// Rcpt enforces that the recipient is local. Local recipient mailboxes are
+// provisioned on demand so messages can be delivered before the recipient first
+// authenticates.
 func (s *session) Rcpt(to string, _ *gosmtp.RcptOptions) error {
 	if !s.domainMatches(to) {
 		return &gosmtp.SMTPError{
@@ -121,31 +153,37 @@ func (s *session) Rcpt(to string, _ *gosmtp.RcptOptions) error {
 			Message:      "User not local; relaying denied",
 		}
 	}
-	if err := s.db.EnsureMailbox(strings.ToLower(to)); err != nil {
-		s.logf("ensure mailbox %q: %v", to, err)
-		return &gosmtp.SMTPError{Code: 451, Message: "Mailbox provisioning failed"}
+	addr := strings.ToLower(to)
+	if err := s.db.EnsureMailbox(addr); err != nil {
+		s.logf("ensure mailbox %q: %v", addr, err)
+		return &gosmtp.SMTPError{Code: 451, Message: "Mailbox provisioning failed; try again"}
 	}
-	s.rcpts = append(s.rcpts, strings.ToLower(to))
+	s.rcpts = append(s.rcpts, addr)
 	return nil
 }
 
-// Data reads the raw MIME payload and commits it verbatim to every recipient
-// mailbox. The payload is stored unmodified to preserve OpenPGP/Autocrypt
-// signatures and DeltaChat group headers.
+// Data reads the raw MIME payload and commits it to every recipient mailbox.
+// The payload is stored unmodified to preserve OpenPGP/Autocrypt signatures
+// and DeltaChat group metadata headers.
+//
+// go-smtp enforces MaxMessageBytes before calling this method (it wraps the
+// reader in an io.LimitedReader and returns a 552 if the limit is hit), so we
+// do not need to re-check here.
 func (s *session) Data(r io.Reader) error {
 	if s.authUser == "" {
+		// Belt-and-suspenders guard; the framework should prevent this.
 		return gosmtp.ErrAuthRequired
 	}
 	body, err := io.ReadAll(r)
 	if err != nil {
-		// go-smtp surfaces the 552 size-limit error here when the cap is hit.
 		return err
 	}
 	now := time.Now()
 	for _, rcpt := range s.rcpts {
 		if _, err := s.db.AppendMessage(rcpt, body, 0, now); err != nil {
-			s.logf("store message for %q: %v", rcpt, err)
-			return &gosmtp.SMTPError{Code: 451, Message: "Message storage failed"}
+			s.logf("store %d-byte message for %q: %v", len(body), rcpt, err)
+			// RFC 5321 §4.2.1: transient local failure.
+			return &gosmtp.SMTPError{Code: 451, Message: "Message storage failed; try again"}
 		}
 	}
 	s.logf("stored %d-byte message from %q to %v", len(body), s.from, s.rcpts)
@@ -161,7 +199,8 @@ func (s *session) Reset() {
 // Logout releases session resources.
 func (s *session) Logout() error { return nil }
 
-// domainMatches reports whether addr is within the configured local domain.
+// domainMatches reports whether addr belongs to the configured local domain.
+// Comparison is case-insensitive per RFC 5321 §2.3.5.
 func (s *session) domainMatches(addr string) bool {
 	at := strings.LastIndex(addr, "@")
 	if at < 0 {

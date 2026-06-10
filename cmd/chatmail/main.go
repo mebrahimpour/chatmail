@@ -16,10 +16,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/local/chatmail/internal/database"
-	"github.com/local/chatmail/internal/imap"
-	"github.com/local/chatmail/internal/smtp"
+	"chatmail/internal/database"
+	"chatmail/internal/imap"
+	"chatmail/internal/smtp"
 )
+
+// version is set at build time via:
+//
+//	go build -ldflags "-X main.version=$(git describe --tags --always --dirty)"
+var version = "dev"
 
 func main() {
 	var (
@@ -43,7 +48,7 @@ func main() {
 		logger.Fatalf("open database: %v", err)
 	}
 	defer db.Close()
-	logger.Printf("opened database %s (domain %s)", dbPath, db.Domain())
+	logger.Printf("chatmail %s started (domain=%s data=%s)", version, db.Domain(), dbPath)
 
 	smtpServer := smtp.NewServer(db, *smtpAddr, logger)
 	imapServer := imap.NewServer(db, logger)
@@ -53,20 +58,23 @@ func main() {
 
 	var wg sync.WaitGroup
 
+	// SMTP goroutine.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		logger.Printf("SMTP engine listening on %s", *smtpAddr)
+		logger.Printf("SMTP listening on %s", *smtpAddr)
 		if err := smtpServer.ListenAndServe(); err != nil {
 			select {
 			case <-ctx.Done():
 			default:
-				logger.Printf("SMTP server stopped: %v", err)
+				logger.Printf("SMTP stopped unexpectedly: %v", err)
 				stop()
 			}
 		}
 	}()
 
+	// IMAP goroutine — pre-bind the listener so we can report the error
+	// before the accept loop starts and avoid a race with the WaitGroup.
 	imapLn, err := net.Listen("tcp", *imapAddr)
 	if err != nil {
 		logger.Fatalf("listen IMAP %q: %v", *imapAddr, err)
@@ -74,17 +82,18 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		logger.Printf("IMAP engine listening on %s", *imapAddr)
+		logger.Printf("IMAP listening on %s", *imapAddr)
 		if err := imapServer.Serve(imapLn); err != nil {
 			select {
 			case <-ctx.Done():
 			default:
-				logger.Printf("IMAP server stopped: %v", err)
+				logger.Printf("IMAP stopped unexpectedly: %v", err)
 				stop()
 			}
 		}
 	}()
 
+	// Retention sweep goroutine.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -100,10 +109,12 @@ func main() {
 	logger.Printf("chatmail stopped")
 }
 
-// runRetention periodically flags messages older than maxAge for deletion. The
-// first sweep runs shortly after startup so a freshly booted server reclaims
-// space promptly rather than waiting a full interval.
+// runRetention periodically flags messages older than maxAge for deletion.
+// The first sweep fires shortly after startup (after a one-minute warm-up)
+// so a freshly booted server reclaims storage promptly rather than waiting a
+// full interval.
 func runRetention(ctx context.Context, db *database.DB, maxAge, every time.Duration, logger *log.Logger) {
+	// Run once a minute after startup, then on the full interval.
 	timer := time.NewTimer(time.Minute)
 	defer timer.Stop()
 	for {

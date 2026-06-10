@@ -1,7 +1,23 @@
 // Package imap implements the chatmail IMAP engine on top of the
 // emersion/go-imap/v2 imapserver framework. The framework owns wire-protocol
-// parsing (tagged commands, literals, sequence sets); this package supplies a
-// bbolt-backed Session that exposes a single INBOX per user.
+// parsing (tagged commands, literals, sequence sets, SASL); this package
+// supplies a bbolt-backed Session that exposes a single INBOX per authenticated
+// user.
+//
+// Design notes:
+//   - TLS is intentionally absent; encryption is terminated by stunnel4 and
+//     the engine speaks plaintext on its loopback port.
+//   - InsecureAuth must be enabled so LOGIN/AUTHENTICATE are accepted without
+//     an in-process TLS layer.
+//   - IMAP LOGIN rejects unknown users; SMTP AUTH performs auto-registration.
+//     This asymmetry is intentional: the first interaction is always a
+//     submission from a client that already knows its credentials.
+//   - The session holds an in-memory snapshot of the mailbox taken at SELECT
+//     time. Mutations (STORE, EXPUNGE, APPEND) are written through to bbolt
+//     and the snapshot is reloaded so sequence numbers remain stable.
+//   - IDLE blocks until the client sends DONE. The engine does not push
+//     unsolicited EXISTS/EXPUNGE updates; clients discover new mail by
+//     re-SELECTing.
 package imap
 
 import (
@@ -15,15 +31,12 @@ import (
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-message/textproto"
 
-	"github.com/local/chatmail/internal/database"
+	"chatmail/internal/database"
 )
 
 const inbox = "INBOX"
 
 // NewServer constructs an imapserver.Server backed by the chatmail database.
-// TLS is intentionally omitted: encryption is terminated by stunnel4 and the
-// engine speaks plaintext on its loopback port. InsecureAuth therefore must be
-// enabled so LOGIN/AUTHENTICATE are accepted without an in-process TLS layer.
 func NewServer(db *database.DB, logger *log.Logger) *imapserver.Server {
 	opts := &imapserver.Options{
 		NewSession: func(_ *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
@@ -38,10 +51,7 @@ func NewServer(db *database.DB, logger *log.Logger) *imapserver.Server {
 	return imapserver.New(opts)
 }
 
-// session is the per-connection IMAP state. After SELECT it holds an immutable
-// snapshot of the mailbox (sorted by ascending UID); sequence number N maps to
-// snapshot index N-1. Mutations (STORE/EXPUNGE/APPEND) are written through to
-// bbolt and the snapshot is reloaded so sequence numbers stay consistent.
+// session is the per-connection IMAP state.
 type session struct {
 	db     *database.DB
 	logger *log.Logger
@@ -53,12 +63,15 @@ type session struct {
 	uidValid uint32
 }
 
+// Compile-time proof that *session satisfies the framework interface.
 var _ imapserver.Session = (*session)(nil)
 
-// --- Not authenticated state ---
+// ---------------------------------------------------------------------------
+// Not-authenticated state
+// ---------------------------------------------------------------------------
 
 // Login validates credentials against the Users bucket. Unknown accounts are
-// rejected (no auto-registration on the IMAP side).
+// rejected — there is no auto-registration on the IMAP side.
 func (s *session) Login(username, password string) error {
 	if err := s.db.VerifyCredentials(username, password); err != nil {
 		return imapserver.ErrAuthFailed
@@ -69,11 +82,17 @@ func (s *session) Login(username, password string) error {
 
 func (s *session) Close() error { return nil }
 
-// --- Authenticated state ---
+// ---------------------------------------------------------------------------
+// Authenticated state
+// ---------------------------------------------------------------------------
 
 func (s *session) Select(mailbox string, _ *imap.SelectOptions) (*imap.SelectData, error) {
 	if !strings.EqualFold(mailbox, inbox) {
-		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeNonExistent, Text: "No such mailbox"}
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeNonExistent,
+			Text: "No such mailbox",
+		}
 	}
 	if err := s.reload(); err != nil {
 		return nil, err
@@ -104,7 +123,11 @@ func (s *session) Unselect() error {
 
 func (s *session) Status(mailbox string, options *imap.StatusOptions) (*imap.StatusData, error) {
 	if !strings.EqualFold(mailbox, inbox) {
-		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeNonExistent, Text: "No such mailbox"}
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeNonExistent,
+			Text: "No such mailbox",
+		}
 	}
 	msgs, err := s.db.LoadMessages(s.user)
 	if err != nil && err != database.ErrNoMailbox {
@@ -145,9 +168,8 @@ func (s *session) Status(mailbox string, options *imap.StatusOptions) (*imap.Sta
 	return data, nil
 }
 
-func (s *session) List(w *imapserver.ListWriter, ref string, patterns []string, options *imap.ListOptions) error {
+func (s *session) List(w *imapserver.ListWriter, ref string, patterns []string, _ *imap.ListOptions) error {
 	if len(patterns) == 0 {
-		// A nil-pattern LIST is a request for the hierarchy delimiter.
 		return w.WriteList(&imap.ListData{Attrs: []imap.MailboxAttr{imap.MailboxAttrNoSelect}, Delim: '/'})
 	}
 	for _, pattern := range patterns {
@@ -160,7 +182,11 @@ func (s *session) List(w *imapserver.ListWriter, ref string, patterns []string, 
 
 func (s *session) Append(mailbox string, r imap.LiteralReader, options *imap.AppendOptions) (*imap.AppendData, error) {
 	if !strings.EqualFold(mailbox, inbox) {
-		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeTryCreate, Text: "No such mailbox"}
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeTryCreate,
+			Text: "No such mailbox",
+		}
 	}
 	var buf bytes.Buffer
 	if _, err := buf.ReadFrom(r); err != nil {
@@ -178,7 +204,9 @@ func (s *session) Append(mailbox string, r imap.LiteralReader, options *imap.App
 	return &imap.AppendData{UID: imap.UID(uid), UIDValidity: uidValid}, nil
 }
 
-// --- Selected state ---
+// ---------------------------------------------------------------------------
+// Selected state
+// ---------------------------------------------------------------------------
 
 func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *imap.FetchOptions) error {
 	markSeen := false
@@ -194,14 +222,12 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 		if !contains(numSet, seqNum, m.UID, s.maxSeq(), s.maxUID()) {
 			continue
 		}
-
 		if markSeen && m.Flags&database.FlagSeen == 0 {
 			m.Flags |= database.FlagSeen
 			if err := s.db.SetFlags(s.user, m.UID, m.Flags); err != nil {
 				return err
 			}
 		}
-
 		rw := w.CreateMessage(seqNum)
 		if err := writeMessage(rw, m, options); err != nil {
 			return err
@@ -210,7 +236,7 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 	return nil
 }
 
-func (s *session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *imap.StoreFlags, options *imap.StoreOptions) error {
+func (s *session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *imap.StoreFlags, _ *imap.StoreOptions) error {
 	for i, m := range s.msgs {
 		seqNum := uint32(i) + 1
 		if !contains(numSet, seqNum, m.UID, s.maxSeq(), s.maxUID()) {
@@ -224,12 +250,15 @@ func (s *session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *im
 	if flags.Silent {
 		return nil
 	}
+	// Emit updated FLAGS for matched messages via a FETCH response.
 	return s.Fetch(w, numSet, &imap.FetchOptions{Flags: true})
 }
 
+// Expunge removes messages flagged \Deleted. If uids is non-nil (UID EXPUNGE),
+// only the intersection of flagged messages and uids is removed. Responses are
+// emitted in descending sequence order so the client's remaining sequence
+// numbers stay valid as the list shrinks.
 func (s *session) Expunge(w *imapserver.ExpungeWriter, uids *imap.UIDSet) error {
-	// Emit EXPUNGE responses in descending sequence order so that the
-	// client's remaining sequence numbers stay valid as messages are removed.
 	for i := len(s.msgs) - 1; i >= 0; i-- {
 		m := s.msgs[i]
 		if uids != nil && !uids.Contains(imap.UID(m.UID)) {
@@ -248,7 +277,9 @@ func (s *session) Expunge(w *imapserver.ExpungeWriter, uids *imap.UIDSet) error 
 	return s.reload()
 }
 
-func (s *session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria, options *imap.SearchOptions) (*imap.SearchData, error) {
+// Search implements the criteria subset needed by DeltaChat:
+// sequence/UID sets, system flags, and date windows.
+func (s *session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria, _ *imap.SearchOptions) (*imap.SearchData, error) {
 	var (
 		data   imap.SearchData
 		seqSet imap.SeqSet
@@ -284,16 +315,21 @@ func (s *session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria,
 	return &data, nil
 }
 
+// Poll is called by the framework for unsolicited updates (new EXISTS, EXPUNGE
+// from another session). We do not maintain cross-session state, so this is a
+// no-op.
 func (s *session) Poll(_ *imapserver.UpdateWriter, _ bool) error { return nil }
 
-// Idle blocks until the client terminates the IDLE command. The engine does not
-// push unsolicited updates; clients observe new mail by re-selecting INBOX.
+// Idle blocks until the client terminates the IDLE command. New mail is not
+// pushed; clients observe it by re-SELECTing after DONE.
 func (s *session) Idle(_ *imapserver.UpdateWriter, stop <-chan struct{}) error {
 	<-stop
 	return nil
 }
 
-// --- Unsupported mutating operations on the fixed INBOX-only namespace ---
+// ---------------------------------------------------------------------------
+// Unsupported mutating operations on the fixed INBOX-only namespace
+// ---------------------------------------------------------------------------
 
 func (s *session) Create(string, *imap.CreateOptions) error {
 	return &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Mailbox creation is not supported"}
@@ -307,10 +343,16 @@ func (s *session) Rename(string, string, *imap.RenameOptions) error {
 func (s *session) Subscribe(string) error   { return nil }
 func (s *session) Unsubscribe(string) error { return nil }
 func (s *session) Copy(imap.NumSet, string) (*imap.CopyData, error) {
-	return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeTryCreate, Text: "No such mailbox"}
+	return nil, &imap.Error{
+		Type: imap.StatusResponseTypeNo,
+		Code: imap.ResponseCodeTryCreate,
+		Text: "No such mailbox",
+	}
 }
 
-// --- helpers ---
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
 
 func (s *session) reload() error {
 	msgs, err := s.db.LoadMessages(s.user)
@@ -318,10 +360,10 @@ func (s *session) reload() error {
 		return err
 	}
 	s.msgs = msgs
-	if s.uidNext, err = s.db.NextUID(s.user); err != nil {
+	if s.uidNext, err = s.db.NextUID(s.user); err != nil && err != database.ErrNoMailbox {
 		return err
 	}
-	if s.uidValid, err = s.db.UIDValidity(s.user); err != nil {
+	if s.uidValid, err = s.db.UIDValidity(s.user); err != nil && err != database.ErrNoMailbox {
 		return err
 	}
 	return nil
@@ -336,14 +378,18 @@ func (s *session) maxUID() uint32 {
 	return s.msgs[len(s.msgs)-1].UID
 }
 
-// contains reports whether a message identified by (seqNum, uid) is selected by
-// numSet. Dynamic "*" ranges are resolved against the mailbox maxima.
+// ---------------------------------------------------------------------------
+// NumSet matching
+// ---------------------------------------------------------------------------
+
+// contains reports whether a message at (seqNum, uid) is selected by numSet.
+// Dynamic "*" boundaries are resolved against the current mailbox maxima.
 func contains(numSet imap.NumSet, seqNum, uid, maxSeq, maxUID uint32) bool {
 	switch set := numSet.(type) {
 	case imap.SeqSet:
-		return rangeContains(staticSeq(set, maxSeq), seqNum)
+		return rangeContains(resolveSeqSet(set, maxSeq), seqNum)
 	case imap.UIDSet:
-		return rangeContains(staticUID(set, maxUID), uid)
+		return rangeContains(resolveUIDSet(set, maxUID), uid)
 	default:
 		return false
 	}
@@ -358,7 +404,7 @@ func rangeContains(ranges [][2]uint32, n uint32) bool {
 	return false
 }
 
-func staticSeq(set imap.SeqSet, max uint32) [][2]uint32 {
+func resolveSeqSet(set imap.SeqSet, max uint32) [][2]uint32 {
 	out := make([][2]uint32, 0, len(set))
 	for _, r := range set {
 		out = append(out, resolveRange(r.Start, r.Stop, max))
@@ -366,7 +412,7 @@ func staticSeq(set imap.SeqSet, max uint32) [][2]uint32 {
 	return out
 }
 
-func staticUID(set imap.UIDSet, max uint32) [][2]uint32 {
+func resolveUIDSet(set imap.UIDSet, max uint32) [][2]uint32 {
 	out := make([][2]uint32, 0, len(set))
 	for _, r := range set {
 		out = append(out, resolveRange(uint32(r.Start), uint32(r.Stop), max))
@@ -374,8 +420,8 @@ func staticUID(set imap.UIDSet, max uint32) [][2]uint32 {
 	return out
 }
 
-// resolveRange converts a possibly-dynamic IMAP range into a concrete [lo,hi]
-// pair. The value 0 represents "*", the largest seq/UID in the mailbox.
+// resolveRange converts a possibly-dynamic IMAP range [start,stop] (where 0
+// means "*" = the highest existing num) into a concrete [lo, hi] pair.
 func resolveRange(start, stop, max uint32) [2]uint32 {
 	if start == 0 {
 		start = max
@@ -389,11 +435,11 @@ func resolveRange(start, stop, max uint32) [2]uint32 {
 	return [2]uint32{start, stop}
 }
 
-func definedFlags() []imap.Flag {
-	return []imap.Flag{imap.FlagSeen, imap.FlagAnswered, imap.FlagFlagged, imap.FlagDeleted, imap.FlagDraft}
-}
+// ---------------------------------------------------------------------------
+// Flag conversion
+// ---------------------------------------------------------------------------
 
-// systemFlagBits maps the five supported system flags to their bitmask values.
+// systemFlagBits maps the five system flags to their bitmask values.
 var systemFlagBits = []struct {
 	flag imap.Flag
 	bit  uint32
@@ -405,7 +451,6 @@ var systemFlagBits = []struct {
 	{imap.FlagDraft, database.FlagDraft},
 }
 
-// flagsToBitmask converts a list of IMAP flags to the stored bitmask.
 func flagsToBitmask(flags []imap.Flag) uint32 {
 	var b uint32
 	for _, f := range flags {
@@ -418,15 +463,18 @@ func flagsToBitmask(flags []imap.Flag) uint32 {
 	return b
 }
 
-// bitmaskToFlags converts the stored bitmask to a list of IMAP flags.
 func bitmaskToFlags(b uint32) []imap.Flag {
-	flags := []imap.Flag{}
+	var flags []imap.Flag
 	for _, sf := range systemFlagBits {
 		if b&sf.bit != 0 {
 			flags = append(flags, sf.flag)
 		}
 	}
 	return flags
+}
+
+func definedFlags() []imap.Flag {
+	return []imap.Flag{imap.FlagSeen, imap.FlagAnswered, imap.FlagFlagged, imap.FlagDeleted, imap.FlagDraft}
 }
 
 func applyStore(cur uint32, store *imap.StoreFlags) uint32 {
@@ -443,9 +491,13 @@ func applyStore(cur uint32, store *imap.StoreFlags) uint32 {
 	}
 }
 
-// writeMessage emits a single FETCH response, mirroring the item handling of
-// the upstream in-memory server. Body section extraction is delegated to the
-// framework so MIME structure parsing stays correct.
+// ---------------------------------------------------------------------------
+// FETCH response assembly
+// ---------------------------------------------------------------------------
+
+// writeMessage emits a single FETCH response. Body section extraction and MIME
+// structure parsing are delegated to the imapserver framework helpers so the
+// implementation stays protocol-correct for nested multipart messages.
 func writeMessage(w *imapserver.FetchResponseWriter, m *database.Message, options *imap.FetchOptions) error {
 	w.WriteUID(imap.UID(m.UID))
 
@@ -508,16 +560,23 @@ func extractEnvelope(body []byte) *imap.Envelope {
 	return imapserver.ExtractEnvelope(header)
 }
 
-// matchSearch implements the minimal SEARCH criteria needed by DeltaChat:
-// sequence/UID sets, system flags, and date windows.
+// ---------------------------------------------------------------------------
+// SEARCH criteria matching
+// ---------------------------------------------------------------------------
+
+// matchSearch evaluates the DeltaChat-relevant SEARCH criteria subset:
+// sequence/UID set membership, system flags, and date windows.
+//
+// Text, header, and body searches are not implemented (they would require
+// full-text indexing). Unrecognised criteria cause the message to be excluded.
 func matchSearch(m *database.Message, seqNum uint32, criteria *imap.SearchCriteria, maxSeq, maxUID uint32) bool {
 	for _, set := range criteria.SeqNum {
-		if !rangeContains(staticSeq(set, maxSeq), seqNum) {
+		if !rangeContains(resolveSeqSet(set, maxSeq), seqNum) {
 			return false
 		}
 	}
 	for _, set := range criteria.UID {
-		if !rangeContains(staticUID(set, maxUID), m.UID) {
+		if !rangeContains(resolveUIDSet(set, maxUID), m.UID) {
 			return false
 		}
 	}

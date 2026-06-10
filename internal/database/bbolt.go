@@ -1,6 +1,28 @@
 // Package database implements the bbolt-backed storage layer for the chatmail
-// server. It owns the bucket hierarchy, the binary message serialization
+// server. It owns the bucket hierarchy, the binary message serialisation
 // format, and all read/write transactions used by the SMTP and IMAP engines.
+//
+// Bucket hierarchy:
+//
+//	Configuration/          top-level
+//	  ServerDomain          []byte
+//	Users/                  top-level
+//	  <email>               bcrypt hash
+//	Mailboxes/              top-level
+//	  <email>/              sub-bucket
+//	    Metadata/           sub-bucket
+//	      NextUID           uint32 BE
+//	      UIDValidity       uint32 BE
+//	    Messages/           sub-bucket
+//	      <8-digit-key>     serialised Message
+//
+// Message wire format (20-byte header + payload):
+//
+//	0x00–0x03  uint32 BE  UID
+//	0x04–0x07  uint32 BE  Flags bitmask
+//	0x08–0x0F  int64  BE  InternalDate (Unix seconds)
+//	0x10–0x13  uint32 BE  Length (N)
+//	0x14–..    []byte     RFC 822 payload (N bytes)
 package database
 
 import (
@@ -15,7 +37,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// Top-level bucket names, per the design specification.
+// Top-level bucket names.
 var (
 	bucketConfiguration = []byte("Configuration")
 	bucketUsers         = []byte("Users")
@@ -39,33 +61,38 @@ const (
 	FlagDraft    uint32 = 0x00000010
 )
 
-// ErrAuthFailed is returned when a known user supplies an incorrect password.
+// ErrAuthFailed is returned when credentials are invalid or the user does not
+// exist. It is intentionally opaque to avoid user-enumeration.
 var ErrAuthFailed = errors.New("authentication credentials invalid")
 
-// ErrNoMailbox is returned when a mailbox does not exist.
+// ErrNoMailbox is returned when the requested mailbox does not exist.
 var ErrNoMailbox = errors.New("mailbox does not exist")
 
-// Message is the decoded form of a serialized message stored in a mailbox.
+// Message is the decoded representation of a single stored email.
 type Message struct {
 	UID          uint32
 	Flags        uint32
-	InternalDate int64
-	Body         []byte
+	InternalDate int64  // Unix seconds
+	Body         []byte // Raw RFC 822 payload
 }
 
-// DB wraps a bbolt database file and exposes chatmail-specific operations.
+// DB wraps a bbolt database and exposes chatmail-specific operations.
 type DB struct {
 	bolt   *bolt.DB
 	domain string
 }
 
 // Open opens (or creates) the bbolt database at path and ensures the top-level
-// bucket hierarchy exists. The provided domain is written to the Configuration
-// bucket on first creation and is used for all subsequent domain-policy checks.
+// bucket hierarchy exists.
+//
+// If the database was previously created with a different domain, the stored
+// domain takes precedence — the caller's flag is ignored and the stored value
+// is returned via DB.Domain(). This prevents silent data corruption when the
+// binary is restarted with a changed flag.
 func Open(path, domain string) (*DB, error) {
 	b, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 5 * time.Second})
 	if err != nil {
-		return nil, fmt.Errorf("open bbolt: %w", err)
+		return nil, fmt.Errorf("open bbolt %q: %w", path, err)
 	}
 
 	db := &DB{bolt: b, domain: domain}
@@ -81,12 +108,13 @@ func Open(path, domain string) (*DB, error) {
 				return err
 			}
 		} else {
+			// Honour the stored domain; caller's flag is advisory on first run only.
 			db.domain = string(existing)
 		}
 		return nil
 	}); err != nil {
-		b.Close()
-		return nil, err
+		_ = b.Close()
+		return nil, fmt.Errorf("init buckets: %w", err)
 	}
 
 	return db, nil
@@ -98,13 +126,19 @@ func (db *DB) Close() error { return db.bolt.Close() }
 // Domain returns the configured server domain.
 func (db *DB) Domain() string { return db.domain }
 
-// Authenticate validates the supplied credentials. If the user does not yet
-// exist, the password is hashed with bcrypt, the user is registered, and an
-// empty mailbox is provisioned (auto-registration). The created return value
-// reports whether a new account was provisioned.
+// ---------------------------------------------------------------------------
+// User & mailbox management
+// ---------------------------------------------------------------------------
+
+// Authenticate validates the supplied credentials within a single write
+// transaction.
 //
-// If the user already exists, the password is verified against the stored hash
-// and ErrAuthFailed is returned on mismatch.
+// If the user does not yet exist, the password is bcrypt-hashed, the user is
+// registered, and an empty mailbox is provisioned (auto-registration). The
+// returned created value is true in this case.
+//
+// If the user already exists, the password is verified against the stored hash.
+// ErrAuthFailed is returned on mismatch.
 func (db *DB) Authenticate(email, password string) (created bool, err error) {
 	err = db.bolt.Update(func(tx *bolt.Tx) error {
 		users := tx.Bucket(bucketUsers)
@@ -112,9 +146,11 @@ func (db *DB) Authenticate(email, password string) (created bool, err error) {
 			if bcrypt.CompareHashAndPassword(hash, []byte(password)) != nil {
 				return ErrAuthFailed
 			}
+			// User already exists and password is correct; ensure their mailbox
+			// is present (idempotent).
 			return ensureMailbox(tx, email)
 		}
-
+		// New user — register and provision.
 		hash, hErr := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 		if hErr != nil {
 			return hErr
@@ -130,8 +166,9 @@ func (db *DB) Authenticate(email, password string) (created bool, err error) {
 
 // VerifyCredentials validates credentials for an existing user without
 // performing auto-registration. It is used by the IMAP LOGIN handler, which
-// must reject unknown accounts. It returns ErrAuthFailed if the user does not
-// exist or the password does not match.
+// must reject unknown accounts.
+//
+// Returns ErrAuthFailed if the user does not exist or the password is wrong.
 func (db *DB) VerifyCredentials(email, password string) error {
 	return db.bolt.View(func(tx *bolt.Tx) error {
 		hash := tx.Bucket(bucketUsers).Get([]byte(email))
@@ -145,7 +182,7 @@ func (db *DB) VerifyCredentials(email, password string) error {
 	})
 }
 
-// UserExists reports whether a user has been registered.
+// UserExists reports whether a user account has been registered.
 func (db *DB) UserExists(email string) bool {
 	exists := false
 	_ = db.bolt.View(func(tx *bolt.Tx) error {
@@ -155,16 +192,25 @@ func (db *DB) UserExists(email string) bool {
 	return exists
 }
 
-// ensureMailbox provisions the Mailboxes/<email> hierarchy (Metadata and
-// Messages sub-buckets) if it does not already exist. NextUID is initialized to
-// 1 and UIDValidity to a stable random uint32 generated once at creation time.
+// EnsureMailbox provisions an empty mailbox for a local recipient that may not
+// have authenticated yet (e.g. a message delivered before the recipient's first
+// login). It is idempotent.
+func (db *DB) EnsureMailbox(email string) error {
+	return db.bolt.Update(func(tx *bolt.Tx) error {
+		return ensureMailbox(tx, email)
+	})
+}
+
+// ensureMailbox provisions Mailboxes/<email>/{Metadata,Messages} if they do
+// not already exist. NextUID is initialised to 1 and UIDValidity to a
+// cryptographically random uint32, generated once at mailbox creation time and
+// never changed thereafter (RFC 9051 §2.3.1.1).
 func ensureMailbox(tx *bolt.Tx, email string) error {
 	mailboxes := tx.Bucket(bucketMailboxes)
 	mbox, err := mailboxes.CreateBucketIfNotExists([]byte(email))
 	if err != nil {
 		return err
 	}
-
 	meta, err := mbox.CreateBucketIfNotExists(bucketMetadata)
 	if err != nil {
 		return err
@@ -172,7 +218,6 @@ func ensureMailbox(tx *bolt.Tx, email string) error {
 	if _, err := mbox.CreateBucketIfNotExists(bucketMessages); err != nil {
 		return err
 	}
-
 	if meta.Get(keyNextUID) == nil {
 		if err := meta.Put(keyNextUID, encodeUint32(1)); err != nil {
 			return err
@@ -186,25 +231,9 @@ func ensureMailbox(tx *bolt.Tx, email string) error {
 	return nil
 }
 
-// MailboxExists reports whether a mailbox has been provisioned for email.
-func (db *DB) MailboxExists(email string) bool {
-	exists := false
-	_ = db.bolt.View(func(tx *bolt.Tx) error {
-		if mb := tx.Bucket(bucketMailboxes).Bucket([]byte(email)); mb != nil {
-			exists = true
-		}
-		return nil
-	})
-	return exists
-}
-
-// EnsureMailbox provisions an empty mailbox for a local recipient that may not
-// have authenticated yet (e.g. the target of an inbound message).
-func (db *DB) EnsureMailbox(email string) error {
-	return db.bolt.Update(func(tx *bolt.Tx) error {
-		return ensureMailbox(tx, email)
-	})
-}
+// ---------------------------------------------------------------------------
+// Mailbox metadata reads
+// ---------------------------------------------------------------------------
 
 // UIDValidity returns the persistent UIDVALIDITY value for a mailbox.
 func (db *DB) UIDValidity(email string) (uint32, error) {
@@ -234,10 +263,17 @@ func (db *DB) NextUID(email string) (uint32, error) {
 	return v, err
 }
 
-// AppendMessage stores a raw RFC822 payload in the recipient mailbox. The
-// message is assigned the current NextUID, NextUID is then incremented, and the
-// message is committed under an 8-character zero-padded key. The mailbox is
-// auto-provisioned if necessary.
+// ---------------------------------------------------------------------------
+// Message CRUD
+// ---------------------------------------------------------------------------
+
+// AppendMessage stores a raw RFC 822 payload in the recipient mailbox. The
+// message is assigned the current NextUID (which is then incremented) and
+// committed under an 8-character zero-padded decimal key. The mailbox is
+// auto-provisioned if it does not yet exist.
+//
+// The flags and internalDate parameters are accepted from the IMAP APPEND
+// command; SMTP delivery passes flags=0 and the current time.
 func (db *DB) AppendMessage(email string, body []byte, flags uint32, internalDate time.Time) (uint32, error) {
 	var uid uint32
 	err := db.bolt.Update(func(tx *bolt.Tx) error {
@@ -255,9 +291,8 @@ func (db *DB) AppendMessage(email string, body []byte, flags uint32, internalDat
 		if err := meta.Put(keyNextUID, encodeUint32(uid+1)); err != nil {
 			return err
 		}
-
-		msg := &Message{UID: uid, Flags: flags, InternalDate: internalDate.Unix(), Body: body}
-		return msgs.Put(messageKey(uid), serialize(msg))
+		m := &Message{UID: uid, Flags: flags, InternalDate: internalDate.Unix(), Body: body}
+		return msgs.Put(messageKey(uid), serialize(m))
 	})
 	if err != nil {
 		return 0, err
@@ -266,6 +301,7 @@ func (db *DB) AppendMessage(email string, body []byte, flags uint32, internalDat
 }
 
 // LoadMessages returns every message in the mailbox sorted by ascending UID.
+// Returns nil, ErrNoMailbox if the mailbox has not been provisioned.
 func (db *DB) LoadMessages(email string) ([]*Message, error) {
 	var out []*Message
 	err := db.bolt.View(func(tx *bolt.Tx) error {
@@ -289,11 +325,15 @@ func (db *DB) LoadMessages(email string) ([]*Message, error) {
 	if err != nil {
 		return nil, err
 	}
+	// bbolt iterates keys in lexicographic order; our 8-digit zero-padded keys
+	// produce ascending UID order up to UID 99,999,999. The explicit sort is a
+	// defensive measure.
 	sort.Slice(out, func(i, j int) bool { return out[i].UID < out[j].UID })
 	return out, nil
 }
 
-// SetFlags overwrites the flag bitmask of a single message.
+// SetFlags overwrites the flag bitmask of a single message. It is a no-op if
+// the message does not exist (uid was already expunged).
 func (db *DB) SetFlags(email string, uid, flags uint32) error {
 	return db.bolt.Update(func(tx *bolt.Tx) error {
 		msgs, err := messagesBucket(tx, email)
@@ -302,7 +342,7 @@ func (db *DB) SetFlags(email string, uid, flags uint32) error {
 		}
 		raw := msgs.Get(messageKey(uid))
 		if raw == nil {
-			return nil
+			return nil // already gone — treat as no-op
 		}
 		msg, err := deserialize(raw)
 		if err != nil {
@@ -313,8 +353,8 @@ func (db *DB) SetFlags(email string, uid, flags uint32) error {
 	})
 }
 
-// DeleteMessage removes a single message from a mailbox. The NextUID counter is
-// never decremented, preserving UID stability across deletions.
+// DeleteMessage removes a single message from the mailbox. The NextUID counter
+// is never decremented, preserving UID monotonicity across deletions.
 func (db *DB) DeleteMessage(email string, uid uint32) error {
 	return db.bolt.Update(func(tx *bolt.Tx) error {
 		msgs, err := messagesBucket(tx, email)
@@ -327,6 +367,9 @@ func (db *DB) DeleteMessage(email string, uid uint32) error {
 
 // SweepRetention applies the \Deleted flag to every message older than maxAge
 // across all mailboxes and returns the number of messages newly flagged.
+//
+// It uses a two-pass approach within each mailbox (collect then update) to
+// avoid modifying the bucket during ForEach iteration.
 func (db *DB) SweepRetention(maxAge time.Duration) (int, error) {
 	cutoff := time.Now().Add(-maxAge).Unix()
 	flagged := 0
@@ -337,11 +380,11 @@ func (db *DB) SweepRetention(maxAge time.Duration) (int, error) {
 			if msgs == nil {
 				return nil
 			}
-			type pending struct {
+			type update struct {
 				key []byte
 				val []byte
 			}
-			var updates []pending
+			var pending []update
 			if err := msgs.ForEach(func(k, v []byte) error {
 				msg, err := deserialize(v)
 				if err != nil {
@@ -349,13 +392,16 @@ func (db *DB) SweepRetention(maxAge time.Duration) (int, error) {
 				}
 				if msg.InternalDate < cutoff && msg.Flags&FlagDeleted == 0 {
 					msg.Flags |= FlagDeleted
-					updates = append(updates, pending{key: append([]byte(nil), k...), val: serialize(msg)})
+					pending = append(pending, update{
+						key: append([]byte(nil), k...),
+						val: serialize(msg),
+					})
 				}
 				return nil
 			}); err != nil {
 				return err
 			}
-			for _, u := range updates {
+			for _, u := range pending {
 				if err := msgs.Put(u.key, u.val); err != nil {
 					return err
 				}
@@ -367,15 +413,11 @@ func (db *DB) SweepRetention(maxAge time.Duration) (int, error) {
 	return flagged, err
 }
 
-// --- serialization helpers ---
+// ---------------------------------------------------------------------------
+// Serialisation helpers
+// ---------------------------------------------------------------------------
 
-// serialize packs a message into the binary schema defined by the spec:
-//
-//	0x00-0x03 uint32 BE UID
-//	0x04-0x07 uint32 BE Flags
-//	0x08-0x0F int64  BE InternalDate
-//	0x10-0x13 uint32 BE Length (N)
-//	0x14-..   []byte     RFC822 payload
+// serialize packs a Message into the binary wire format defined above.
 func serialize(m *Message) []byte {
 	buf := make([]byte, 20+len(m.Body))
 	binary.BigEndian.PutUint32(buf[0:4], m.UID)
@@ -386,13 +428,16 @@ func serialize(m *Message) []byte {
 	return buf
 }
 
+// deserialize unpacks a binary buffer into a Message. The body is always
+// copied into a fresh allocation so the returned Message outlives the bbolt
+// transaction that supplied the buffer.
 func deserialize(buf []byte) (*Message, error) {
 	if len(buf) < 20 {
 		return nil, fmt.Errorf("message payload too short: %d bytes", len(buf))
 	}
 	length := binary.BigEndian.Uint32(buf[16:20])
 	if int(length) > len(buf)-20 {
-		return nil, fmt.Errorf("message length field %d exceeds payload %d", length, len(buf)-20)
+		return nil, fmt.Errorf("message length field %d exceeds available payload %d", length, len(buf)-20)
 	}
 	return &Message{
 		UID:          binary.BigEndian.Uint32(buf[0:4]),
@@ -401,6 +446,10 @@ func deserialize(buf []byte) (*Message, error) {
 		Body:         append([]byte(nil), buf[20:20+length]...),
 	}, nil
 }
+
+// ---------------------------------------------------------------------------
+// Internal transaction helpers
+// ---------------------------------------------------------------------------
 
 func metadataBucket(tx *bolt.Tx, email string) (*bolt.Bucket, error) {
 	mbox := tx.Bucket(bucketMailboxes).Bucket([]byte(email))
@@ -426,6 +475,8 @@ func messagesBucket(tx *bolt.Tx, email string) (*bolt.Bucket, error) {
 	return msgs, nil
 }
 
+// messageKey returns the 8-character zero-padded decimal key for uid.
+// Keys are lexicographically ordered for UIDs in [1, 99_999_999].
 func messageKey(uid uint32) []byte { return []byte(fmt.Sprintf("%08d", uid)) }
 
 func encodeUint32(v uint32) []byte {
@@ -441,6 +492,9 @@ func decodeUint32(b []byte) uint32 {
 	return binary.BigEndian.Uint32(b)
 }
 
+// randomUIDValidity generates a non-zero uint32 suitable for use as a
+// UIDVALIDITY value. It uses crypto/rand and falls back to the current Unix
+// timestamp only if the system RNG fails.
 func randomUIDValidity() uint32 {
 	var b [4]byte
 	if _, err := rand.Read(b[:]); err != nil {

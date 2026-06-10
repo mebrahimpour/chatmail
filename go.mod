@@ -1,4 +1,4 @@
-module github.com/local/chatmail
+module chatmail
 
 go 1.25.0
 

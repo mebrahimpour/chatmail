@@ -185,12 +185,126 @@ def test_history_fetching_roundtrip():
     im.close()
 
 
+# --------------------------------------------------------------------------- #
+# Additional tests (consolidated from all three repos)
+# --------------------------------------------------------------------------- #
+
+def test_multi_recipient_delivery(server_addr=None):
+    """One SMTP DATA transaction delivers to two local recipients."""
+    import socket as _socket
+
+    def _auth_imap(user, pw):
+        s = _socket.create_connection((IMAP_HOST, IMAP_PORT), timeout=10)
+        recv_line(s)  # greeting
+        s.send(f"a1 LOGIN {user} {pw}\r\n".encode())
+        resp = recv_line(s)
+        assert "OK" in resp, f"IMAP LOGIN failed: {resp!r}"
+        return s
+
+    # Register both users via SMTP
+    for u in ["multia@local.chat", "multib@local.chat"]:
+        s = smtp_connect()
+        s.send(b"EHLO local.chat\r\n")
+        recv_smtp(s)
+        tok = _b64("\x00" + u + "\x00password")
+        s.send(f"AUTH PLAIN {tok}\r\n".encode())
+        assert recv_smtp(s).startswith("235"), f"AUTH failed for {u}"
+        s.send(b"MAIL FROM:<sender@local.chat>\r\n")
+        recv_smtp(s)
+        s.send(b"RCPT TO:<multia@local.chat>\r\n")
+        recv_smtp(s)
+        s.send(b"DATA\r\n")
+        recv_smtp(s)
+        s.send(b"Subject: init\r\n\r\ninit\r\n.\r\n")
+        recv_smtp(s)
+        s.close()
+
+    # Now send from multia to both recipients
+    s = smtp_connect()
+    s.send(b"EHLO local.chat\r\n")
+    recv_smtp(s)
+    tok = _b64("\x00multia@local.chat\x00password")
+    s.send(f"AUTH PLAIN {tok}\r\n".encode())
+    assert recv_smtp(s).startswith("235")
+    s.send(b"MAIL FROM:<multia@local.chat>\r\n")
+    recv_smtp(s)
+    s.send(b"RCPT TO:<multia@local.chat>\r\n")
+    recv_smtp(s)
+    s.send(b"RCPT TO:<multib@local.chat>\r\n")
+    recv_smtp(s)
+    s.send(b"DATA\r\n")
+    recv_smtp(s)
+    s.send(b"Subject: multi\r\n\r\nmulti-rcpt body\r\n.\r\n")
+    assert recv_smtp(s).startswith("250"), "DATA response should be 250"
+    s.close()
+
+    # Verify both mailboxes received the message
+    for u in ["multia@local.chat", "multib@local.chat"]:
+        is_ = _auth_imap(u, "password")
+        is_.send(b"a2 SELECT INBOX\r\n")
+        sel = b""
+        while b"a2 " not in sel:
+            sel += is_.recv(4096)
+        assert b"OK" in sel, f"SELECT failed for {u}"
+        is_.close()
+
+    print("[+] multi-recipient delivery: PASS")
+    return True
+
+
+def test_imap_idle():
+    """IDLE command must be accepted and DONE must end it gracefully."""
+    import socket as _socket, threading
+
+    user = "idletest@local.chat"
+    # Ensure user exists via SMTP registration
+    s = smtp_connect()
+    s.send(b"EHLO local.chat\r\n")
+    recv_smtp(s)
+    tok = _b64("\x00" + user + "\x00pw")
+    s.send(f"AUTH PLAIN {tok}\r\n".encode())
+    recv_smtp(s)
+    s.close()
+
+    is_ = _socket.create_connection((IMAP_HOST, IMAP_PORT), timeout=10)
+    recv_line(is_)  # greeting
+    is_.send(b"a1 LOGIN idletest@local.chat pw\r\n")
+    resp = recv_line(is_)
+    assert "OK" in resp, f"LOGIN failed: {resp!r}"
+    is_.send(b"a2 SELECT INBOX\r\n")
+    while True:
+        l = recv_line(is_)
+        if l.startswith("a2 "):
+            break
+    is_.send(b"a3 IDLE\r\n")
+    cont = recv_line(is_)
+    assert cont.startswith("+"), f"Expected continuation, got {cont!r}"
+    # Send DONE after a short pause
+    import time as _time
+    _time.sleep(0.2)
+    is_.send(b"DONE\r\n")
+    resp = recv_line(is_)
+    assert "OK" in resp or "a3 " in resp, f"IDLE DONE response unexpected: {resp!r}"
+    is_.close()
+    print("[+] IMAP IDLE: PASS")
+    return True
+
+
+def _b64(s):
+    import base64
+    return base64.b64encode(s.encode()).decode()
+
+
+
+
 TESTS = [
     test_smtp_auto_registration,
     test_authentication_mismatch,
     test_boundary_protection_external_domain,
     test_payload_envelope_size_limit,
     test_history_fetching_roundtrip,
+    test_multi_recipient_delivery,
+    test_imap_idle,
 ]
 
 
