@@ -1,134 +1,78 @@
-// Command chatmail is the entry point for the minimal chatmail server. It
-// bootstraps the bbolt database, starts the plaintext SMTP and IMAP listeners
-// (TLS is terminated externally by stunnel4), runs the daily retention sweep,
-// and shuts everything down cleanly on SIGINT/SIGTERM.
 package main
 
 import (
-	"context"
-	"flag"
+	"fmt"
+	"io"
 	"log"
-	"net"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"sync"
 	"syscall"
-	"time"
 
 	"chatmail/internal/database"
 	"chatmail/internal/imap"
 	"chatmail/internal/smtp"
 )
 
-// version is set at build time via:
-//
-//	go build -ldflags "-X main.version=$(git describe --tags --always --dirty)"
-var version = "dev"
-
 func main() {
-	var (
-		domain     = flag.String("domain", "local.chat", "local mail domain enforced for all addresses")
-		dataDir    = flag.String("data-dir", "/var/lib/chatmail", "directory holding the bbolt database file")
-		smtpAddr   = flag.String("smtp-addr", "127.0.0.1:1025", "plaintext SMTP listen address")
-		imapAddr   = flag.String("imap-addr", "127.0.0.1:1143", "plaintext IMAP listen address")
-		retention  = flag.Duration("retention", 30*24*time.Hour, "messages older than this are flagged \\Deleted by the sweep")
-		sweepEvery = flag.Duration("sweep-interval", 24*time.Hour, "interval between retention sweeps")
-	)
-	flag.Parse()
+	// Initialize directory first
+	_ = os.MkdirAll("/var/lib/chatmail", 0755)
 
-	logger := log.New(os.Stdout, "", log.LstdFlags|log.Lmsgprefix)
-
-	if err := os.MkdirAll(*dataDir, 0o700); err != nil {
-		logger.Fatalf("create data dir %q: %v", *dataDir, err)
+	// Set up dual logging to both standard output and log file
+	logFilePath := "/var/lib/chatmail/chatmail.log"
+	logFile, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err == nil {
+		defer logFile.Close()
+		mw := io.MultiWriter(os.Stdout, logFile)
+		log.SetOutput(mw)
+	} else {
+		log.Printf("Warning: Could not open log file at %s: %v", logFilePath, err)
 	}
-	dbPath := filepath.Join(*dataDir, "chatmail.db")
-	db, err := database.Open(dbPath, *domain)
+
+	log.Println("Starting Minimal Chatmail Server Core Process...")
+
+	// 1. Initialize Bbolt Database
+	dbPath := "/var/lib/chatmail/chatmail.db"
+	db, err := database.NewBboltDB(dbPath)
 	if err != nil {
-		logger.Fatalf("open database: %v", err)
+		log.Fatalf("Initialization of Bbolt Database failed: %v", err)
 	}
 	defer db.Close()
-	logger.Printf("chatmail %s started (domain=%s data=%s)", version, db.Domain(), dbPath)
+	log.Printf("Bbolt Database mapped successfully from %s", dbPath)
 
-	smtpServer := smtp.NewServer(db, *smtpAddr, logger)
-	imapServer := imap.NewServer(db, logger)
+	// startErrCh receives the first fatal startup error from either server.
+	// Buffered to 2 so goroutines never block even if main has already exited.
+	startErrCh := make(chan error, 2)
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
-	var wg sync.WaitGroup
-
-	// SMTP goroutine.
-	wg.Add(1)
+	// 2. Spawn Plaintext SMTP Engine (Inbound Routing)
+	smtpServer := smtp.NewServer("127.0.0.1:1025", db)
 	go func() {
-		defer wg.Done()
-		logger.Printf("SMTP listening on %s", *smtpAddr)
+		log.Println("SMTP Engine listening on 127.0.0.1:1025 (Behind Stunnel4 587)")
 		if err := smtpServer.ListenAndServe(); err != nil {
-			select {
-			case <-ctx.Done():
-			default:
-				logger.Printf("SMTP stopped unexpectedly: %v", err)
-				stop()
-			}
+			startErrCh <- fmt.Errorf("SMTP engine: %w", err)
 		}
 	}()
 
-	// IMAP goroutine — pre-bind the listener so we can report the error
-	// before the accept loop starts and avoid a race with the WaitGroup.
-	imapLn, err := net.Listen("tcp", *imapAddr)
-	if err != nil {
-		logger.Fatalf("listen IMAP %q: %v", *imapAddr, err)
-	}
-	wg.Add(1)
+	// 3. Spawn Plaintext IMAP Engine (Index/Sync Engine)
+	imapServer := imap.NewServer("127.0.0.1:1143", db)
 	go func() {
-		defer wg.Done()
-		logger.Printf("IMAP listening on %s", *imapAddr)
-		if err := imapServer.Serve(imapLn); err != nil {
-			select {
-			case <-ctx.Done():
-			default:
-				logger.Printf("IMAP stopped unexpectedly: %v", err)
-				stop()
-			}
+		log.Println("IMAP Engine listening on 127.0.0.1:1143 (Behind Stunnel4 993)")
+		if err := imapServer.ListenAndServe(); err != nil {
+			startErrCh <- fmt.Errorf("IMAP engine: %w", err)
 		}
 	}()
 
-	// Retention sweep goroutine.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		runRetention(ctx, db, *retention, *sweepEvery, logger)
-	}()
+	// 4. Capture OS Signals for Clean Shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	<-ctx.Done()
-	logger.Printf("shutdown signal received, closing listeners")
-
-	_ = smtpServer.Close()
-	_ = imapServer.Close()
-	wg.Wait()
-	logger.Printf("chatmail stopped")
-}
-
-// runRetention periodically flags messages older than maxAge for deletion.
-// The first sweep fires shortly after startup (after a one-minute warm-up)
-// so a freshly booted server reclaims storage promptly rather than waiting a
-// full interval.
-func runRetention(ctx context.Context, db *database.DB, maxAge, every time.Duration, logger *log.Logger) {
-	// Run once a minute after startup, then on the full interval.
-	timer := time.NewTimer(time.Minute)
-	defer timer.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-timer.C:
-			n, err := db.SweepRetention(maxAge)
-			if err != nil {
-				logger.Printf("retention sweep error: %v", err)
-			} else if n > 0 {
-				logger.Printf("retention sweep flagged %d message(s) older than %s", n, maxAge)
-			}
-			timer.Reset(every)
-		}
+	select {
+	case sig := <-sigChan:
+		log.Printf("Received signal %v. Performing transactional Bbolt Sync & Shutdown...", sig)
+	case err := <-startErrCh:
+		log.Fatalf("Server startup error: %v", err)
 	}
+
+	smtpServer.Close()
+	imapServer.Close()
+	log.Println("Server processes cleanly shut down.")
 }

@@ -1,601 +1,1066 @@
-// Package imap implements the chatmail IMAP engine on top of the
-// emersion/go-imap/v2 imapserver framework. The framework owns wire-protocol
-// parsing (tagged commands, literals, sequence sets, SASL); this package
-// supplies a bbolt-backed Session that exposes a single INBOX per authenticated
-// user.
-//
-// Design notes:
-//   - TLS is intentionally absent; encryption is terminated by stunnel4 and
-//     the engine speaks plaintext on its loopback port.
-//   - InsecureAuth must be enabled so LOGIN/AUTHENTICATE are accepted without
-//     an in-process TLS layer.
-//   - IMAP LOGIN rejects unknown users; SMTP AUTH performs auto-registration.
-//     This asymmetry is intentional: the first interaction is always a
-//     submission from a client that already knows its credentials.
-//   - The session holds an in-memory snapshot of the mailbox taken at SELECT
-//     time. Mutations (STORE, EXPUNGE, APPEND) are written through to bbolt
-//     and the snapshot is reloaded so sequence numbers remain stable.
-//   - IDLE blocks until the client sends DONE. The engine does not push
-//     unsolicited EXISTS/EXPUNGE updates; clients discover new mail by
-//     re-SELECTing.
 package imap
 
 import (
 	"bufio"
-	"bytes"
-	"log"
-	"strings"
-	"time"
-
-	"github.com/emersion/go-imap/v2"
-	"github.com/emersion/go-imap/v2/imapserver"
-	"github.com/emersion/go-message/textproto"
-
 	"chatmail/internal/database"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"log"
+	"net"
+	"strings"
+	"sync"
+	"time"
 )
 
-const inbox = "INBOX"
+// connIdleTimeout is the maximum time a connected but idle (non-IDLE-command)
+// client may hold a goroutine open without sending any data.
+const connIdleTimeout = 30 * time.Minute
 
-// NewServer constructs an imapserver.Server backed by the chatmail database.
-func NewServer(db *database.DB, logger *log.Logger) *imapserver.Server {
-	opts := &imapserver.Options{
-		NewSession: func(_ *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
-			return &session{db: db, logger: logger}, nil, nil
-		},
-		Caps:         imap.CapSet{imap.CapIMAP4rev1: {}},
-		InsecureAuth: true,
-	}
-	if logger != nil {
-		opts.Logger = logger
-	}
-	return imapserver.New(opts)
-}
+// connWriteTimeout is the maximum time a single conn.Write call may block.
+// A client that stops reading responses (slow-loris write variant) would
+// otherwise hold the goroutine open indefinitely.
+const connWriteTimeout = 60 * time.Second
 
-// session is the per-connection IMAP state.
-type session struct {
-	db     *database.DB
-	logger *log.Logger
-
-	user     string
-	selected bool
-	msgs     []*database.Message
-	uidNext  uint32
-	uidValid uint32
-}
-
-// Compile-time proof that *session satisfies the framework interface.
-var _ imapserver.Session = (*session)(nil)
-
-// ---------------------------------------------------------------------------
-// Not-authenticated state
-// ---------------------------------------------------------------------------
-
-// Login validates credentials against the Users bucket. Unknown accounts are
-// rejected — there is no auto-registration on the IMAP side.
-func (s *session) Login(username, password string) error {
-	if err := s.db.VerifyCredentials(username, password); err != nil {
-		return imapserver.ErrAuthFailed
-	}
-	s.user = strings.ToLower(username)
-	return nil
-}
-
-func (s *session) Close() error { return nil }
-
-// ---------------------------------------------------------------------------
-// Authenticated state
-// ---------------------------------------------------------------------------
-
-func (s *session) Select(mailbox string, _ *imap.SelectOptions) (*imap.SelectData, error) {
-	if !strings.EqualFold(mailbox, inbox) {
-		return nil, &imap.Error{
-			Type: imap.StatusResponseTypeNo,
-			Code: imap.ResponseCodeNonExistent,
-			Text: "No such mailbox",
+// writeLine sets a short write deadline and writes the complete byte slice.
+// net.Conn.Write is allowed to return a short write with an error; looping here
+// prevents silently truncating large literals/responses. Any final error is
+// deliberately discarded — the next ReadString will catch the broken connection.
+func writeLine(conn net.Conn, data []byte) {
+	_ = conn.SetWriteDeadline(time.Now().Add(connWriteTimeout))
+	defer conn.SetWriteDeadline(time.Time{})
+	for len(data) > 0 {
+		n, err := conn.Write(data)
+		if err != nil {
+			return
 		}
-	}
-	if err := s.reload(); err != nil {
-		return nil, err
-	}
-	s.selected = true
-
-	data := &imap.SelectData{
-		Flags:          definedFlags(),
-		PermanentFlags: append(definedFlags(), imap.FlagWildcard),
-		NumMessages:    uint32(len(s.msgs)),
-		UIDNext:        imap.UID(s.uidNext),
-		UIDValidity:    s.uidValid,
-	}
-	for i, m := range s.msgs {
-		if m.Flags&database.FlagSeen == 0 {
-			data.FirstUnseenSeqNum = uint32(i) + 1
-			break
+		if n <= 0 {
+			return
 		}
+		data = data[n:]
 	}
-	return data, nil
 }
 
-func (s *session) Unselect() error {
-	s.selected = false
-	s.msgs = nil
-	return nil
+type Server struct {
+	addr     string
+	db       *database.BboltDB
+	mu       sync.Mutex
+	listener net.Listener
 }
 
-func (s *session) Status(mailbox string, options *imap.StatusOptions) (*imap.StatusData, error) {
-	if !strings.EqualFold(mailbox, inbox) {
-		return nil, &imap.Error{
-			Type: imap.StatusResponseTypeNo,
-			Code: imap.ResponseCodeNonExistent,
-			Text: "No such mailbox",
-		}
-	}
-	msgs, err := s.db.LoadMessages(s.user)
-	if err != nil && err != database.ErrNoMailbox {
-		return nil, err
-	}
-	uidNext, _ := s.db.NextUID(s.user)
-	uidValid, _ := s.db.UIDValidity(s.user)
+func NewServer(addr string, db *database.BboltDB) *Server {
+	return &Server{addr: addr, db: db}
+}
 
-	data := &imap.StatusData{Mailbox: inbox}
-	if options.NumMessages {
-		n := uint32(len(msgs))
-		data.NumMessages = &n
+func (s *Server) ListenAndServe() error {
+	l, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		return err
 	}
-	if options.UIDNext {
-		data.UIDNext = imap.UID(uidNext)
+	s.mu.Lock()
+	s.listener = l
+	s.mu.Unlock()
+	defer l.Close()
+
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			// Distinguish an intentional Close() from a real network error.
+			// After Close() the listener is nil; treat that as a clean exit.
+			s.mu.Lock()
+			closed := s.listener == nil
+			s.mu.Unlock()
+			if closed {
+				return nil
+			}
+			return err
+		}
+		go s.handleClient(conn)
 	}
-	if options.UIDValidity {
-		data.UIDValidity = uidValid
+}
+
+// Close shuts down the IMAP listener, causing ListenAndServe to return.
+func (s *Server) Close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.listener != nil {
+		_ = s.listener.Close()
+		s.listener = nil
 	}
-	if options.NumUnseen {
-		var n uint32
-		for _, m := range msgs {
-			if m.Flags&database.FlagSeen == 0 {
-				n++
+}
+
+func (s *Server) handleClient(conn net.Conn) {
+	defer conn.Close()
+
+	// 1. Initial Greeting
+	writeLine(conn, []byte("* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN IDLE UIDPLUS] Minimal Chatmail IMAP Server Ready\r\n"))
+
+	authenticated := false
+	selected := false
+	currentUser := ""
+
+	reader := bufio.NewReader(conn)
+
+	for {
+		// Apply an idle read deadline to prevent goroutine leaks from slow/abandoned clients.
+		_ = conn.SetReadDeadline(time.Now().Add(connIdleTimeout))
+
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return
+		}
+		// Clear deadline while processing the command.
+		_ = conn.SetReadDeadline(time.Time{})
+
+		cmdLine := strings.TrimSpace(line)
+		if cmdLine == "" {
+			continue
+		}
+
+		parts := parseIMAPLine(cmdLine)
+		if len(parts) < 2 {
+			continue
+		}
+
+		tag := parts[0]
+		cmdName := strings.ToUpper(parts[1])
+
+		// Suspension check: after authentication, terminate the session as soon as
+		// the backing account disappears or becomes suspended. Allow LOGOUT and
+		// CAPABILITY so clients can still close cleanly or inspect server features,
+		// but block all mailbox/authenticated operations immediately. This avoids a
+		// stale authenticated IMAP session retaining access after admin revocation.
+		if authenticated && cmdName != "LOGOUT" && cmdName != "CAPABILITY" {
+			exists, suspended, err := s.db.GetUserStatus(currentUser)
+			if err != nil {
+				writeLine(conn, []byte(fmt.Sprintf("%s NO Temporary system error\r\n", tag)))
+				continue
+			}
+			if !exists || suspended {
+				writeLine(conn, []byte("* BYE [ALERT] Account disabled by administration\r\n"))
+				return
 			}
 		}
-		data.NumUnseen = &n
-	}
-	if options.NumDeleted {
-		var n uint32
-		for _, m := range msgs {
-			if m.Flags&database.FlagDeleted != 0 {
-				n++
+
+		switch cmdName {
+		case "CAPABILITY":
+			writeLine(conn, []byte(fmt.Sprintf("* CAPABILITY IMAP4rev1 AUTH=PLAIN IDLE UIDPLUS\r\n%s OK CAPABILITY completed\r\n", tag)))
+
+		// RFC 3501 §6.2.2 / RFC 4616 §2 — AUTHENTICATE PLAIN
+		// Supports both the two-step challenge form and the single-step inline
+		// initial-response form: AUTHENTICATE PLAIN <base64>
+		case "AUTHENTICATE":
+			if authenticated {
+				writeLine(conn, []byte(fmt.Sprintf("%s BAD Already authenticated\r\n", tag)))
+				continue
 			}
+			if len(parts) < 3 || strings.ToUpper(parts[2]) != "PLAIN" {
+				writeLine(conn, []byte(fmt.Sprintf("%s NO Unsupported authentication mechanism\r\n", tag)))
+				continue
+			}
+			var b64Payload string
+			if len(parts) >= 4 && parts[3] != "" {
+				// Inline initial response — credentials already present on the
+				// command line; skip the server continuation challenge entirely.
+				b64Payload = parts[3]
+			} else {
+				// Two-step: issue an empty challenge and wait for client response.
+				writeLine(conn, []byte("+ \r\n"))
+				_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+				b64Line, err := reader.ReadString('\n')
+				_ = conn.SetReadDeadline(time.Time{})
+				if err != nil {
+					return
+				}
+				b64Payload = strings.TrimSpace(b64Line)
+			}
+			user, pass, ok := decodePlainAuth(b64Payload)
+			if !ok {
+				writeLine(conn, []byte(fmt.Sprintf("%s BAD Invalid PLAIN encoding\r\n", tag)))
+				continue
+			}
+			_ = s.authenticateUser(tag, user, pass, &authenticated, &currentUser, conn, conn.RemoteAddr().String())
+
+		case "LOGIN":
+			if authenticated {
+				writeLine(conn, []byte(fmt.Sprintf("%s BAD Already authenticated\r\n", tag)))
+				continue
+			}
+			if len(parts) < 4 {
+				writeLine(conn, []byte(fmt.Sprintf("%s BAD Arguments missing\r\n", tag)))
+				continue
+			}
+			user := strings.ToLower(parts[2])
+			pass := parts[3]
+			_ = s.authenticateUser(tag, user, pass, &authenticated, &currentUser, conn, conn.RemoteAddr().String())
+
+		case "SELECT":
+			if !authenticated {
+				writeLine(conn, []byte(fmt.Sprintf("%s NO Authenticate first\r\n", tag)))
+				continue
+			}
+			if len(parts) < 3 {
+				writeLine(conn, []byte(fmt.Sprintf("%s BAD SELECT missing mailbox name\r\n", tag)))
+				continue
+			}
+			if strings.ToUpper(parts[2]) != "INBOX" {
+				writeLine(conn, []byte(fmt.Sprintf("%s NO [NONEXISTENT] Mailbox does not exist\r\n", tag)))
+				continue
+			}
+			count, uidValidity, nextUID, err := s.db.GetMailboxInfo(currentUser)
+			if err != nil {
+				writeLine(conn, []byte(fmt.Sprintf("%s NO Select failed\r\n", tag)))
+				continue
+			}
+			if uidValidity == 0 {
+				// Generate a stable fallback from the current Unix timestamp
+				// rather than emitting a hardcoded magic number.
+				uidValidity = uint32(time.Now().Unix())
+			}
+			if nextUID == 0 {
+				nextUID = count + 1
+			}
+
+			writeLine(conn, []byte("* FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)\r\n"))
+			writeLine(conn, []byte("* OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted)] Flags allowed\r\n"))
+			writeLine(conn, []byte(fmt.Sprintf("* %d EXISTS\r\n", count)))
+			writeLine(conn, []byte(fmt.Sprintf("* OK [UIDVALIDITY %d] UIDs stable\r\n", uidValidity)))
+			writeLine(conn, []byte(fmt.Sprintf("* OK [UIDNEXT %d] Predicted UID\r\n", nextUID)))
+			writeLine(conn, []byte(fmt.Sprintf("%s OK [READ-WRITE] SELECT completed\r\n", tag)))
+			selected = true
+
+		case "IDLE":
+			if !authenticated {
+				writeLine(conn, []byte(fmt.Sprintf("%s NO Authenticate first\r\n", tag)))
+				continue
+			}
+			if !selected {
+				writeLine(conn, []byte(fmt.Sprintf("%s NO Select mailbox first\r\n", tag)))
+				continue
+			}
+			writeLine(conn, []byte("+ idling\r\n"))
+
+			// Register for push notifications from StoreMessage.
+			notifyCh := make(chan struct{}, 10)
+			s.db.RegisterNotifier(currentUser, notifyCh)
+
+			// A single helper goroutine owns the reader while handleClient is inside
+			// IDLE. If the server-side timer ends IDLE first, we set a read deadline
+			// and wait for this goroutine to exit before the main loop reads again —
+			// preventing both bufio.Reader races and leaked blocked goroutines.
+			clientDone := make(chan string, 1)
+			clientErr := make(chan error, 1)
+			go func() {
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					clientErr <- err
+					return
+				}
+				clientDone <- strings.ToUpper(strings.TrimSpace(line))
+			}()
+
+			idleTimer := time.NewTimer(28 * time.Minute)
+			idleDone := false
+			for !idleDone {
+				select {
+				case <-notifyCh:
+					for len(notifyCh) > 0 {
+						<-notifyCh
+					}
+					count, _, _, err := s.db.GetMailboxInfo(currentUser)
+					if err == nil {
+						writeLine(conn, []byte(fmt.Sprintf("* %d EXISTS\r\n", count)))
+					}
+
+				case <-idleTimer.C:
+					writeLine(conn, []byte("* OK Still here\r\n"))
+					_ = conn.SetReadDeadline(time.Now())
+					select {
+					case <-clientDone:
+					case <-clientErr:
+					case <-time.After(2 * time.Second):
+						idleTimer.Stop()
+						s.db.DeregisterNotifier(currentUser, notifyCh)
+						return
+					}
+					_ = conn.SetReadDeadline(time.Time{})
+					idleDone = true
+
+				case cmd := <-clientDone:
+					if cmd == "DONE" {
+						idleDone = true
+					} else {
+						writeLine(conn, []byte("* BAD Expected DONE while idling\r\n"))
+						idleDone = true
+					}
+
+				case <-clientErr:
+					idleTimer.Stop()
+					s.db.DeregisterNotifier(currentUser, notifyCh)
+					return
+				}
+			}
+
+			idleTimer.Stop()
+			s.db.DeregisterNotifier(currentUser, notifyCh)
+			writeLine(conn, []byte(fmt.Sprintf("%s OK IDLE completed\r\n", tag)))
+
+		case "UID":
+			if !selected {
+				writeLine(conn, []byte(fmt.Sprintf("%s NO Select mailbox first\r\n", tag)))
+				continue
+			}
+			if len(parts) < 3 {
+				writeLine(conn, []byte(fmt.Sprintf("%s BAD UID command format error\r\n", tag)))
+				continue
+			}
+			subCmd := strings.ToUpper(parts[2])
+			if subCmd == "FETCH" {
+				if len(parts) < 4 {
+					writeLine(conn, []byte(fmt.Sprintf("%s BAD UID FETCH missing arguments\r\n", tag)))
+					continue
+				}
+				uidRange := parts[3]
+				cmdUpper := strings.ToUpper(cmdLine)
+				wantBody := strings.Contains(cmdUpper, "BODY") || strings.Contains(cmdUpper, "RFC822")
+				var msgsList []database.DBMessage
+				var err error
+				if wantBody {
+					msgsList, err = s.db.FetchMessages(currentUser)
+				} else {
+					msgsList, err = s.db.FetchMessageHeaders(currentUser)
+				}
+				if err != nil {
+					writeLine(conn, []byte(fmt.Sprintf("%s NO Failed to read mailbox messages\r\n", tag)))
+					continue
+				}
+
+				// Sequence numbers must be contiguous starting from 1 over the
+				// current snapshot — they cannot use raw slice indices.
+				maxUID := highestUID(msgsList)
+				seqNum := 0
+				for _, msg := range msgsList {
+					seqNum++
+					if matchUID(msg.UID, maxUID, uidRange) {
+						flagsStr := formatFlags(msg.Flags)
+						if wantBody {
+							// IMAP literals must advertise the exact number of bytes that
+							// will be sent. Use the copied payload length rather than the
+							// persisted Length field so a corrupt legacy row cannot make
+							// clients hang waiting for bytes that will never arrive.
+							literalSize := len(msg.Payload)
+							writeLine(conn, []byte(fmt.Sprintf("* %d FETCH (UID %d FLAGS %s BODY[] {%d}\r\n", seqNum, msg.UID, flagsStr, literalSize)))
+							writeLine(conn, msg.Payload)
+							// RFC 3501 §4.3: after the literal, exactly one CRLF
+							// before the closing ')' regardless of whether the
+							// payload itself ends in CRLF.
+							if len(msg.Payload) == 0 || msg.Payload[len(msg.Payload)-1] != '\n' {
+								writeLine(conn, []byte("\r\n)\r\n"))
+							} else {
+								writeLine(conn, []byte(")\r\n"))
+							}
+						} else {
+							writeLine(conn, []byte(fmt.Sprintf("* %d FETCH (UID %d FLAGS %s)\r\n", seqNum, msg.UID, flagsStr)))
+						}
+					}
+				}
+				writeLine(conn, []byte(fmt.Sprintf("%s OK UID FETCH completed\r\n", tag)))
+
+			} else if subCmd == "STORE" {
+				if len(parts) < 5 {
+					writeLine(conn, []byte(fmt.Sprintf("%s BAD UID STORE missing arguments\r\n", tag)))
+					continue
+				}
+				uidRange := parts[3]
+				// parts[4] is the FLAGS item name (e.g. "+FLAGS", "FLAGS", "-FLAGS",
+				// "+FLAGS.SILENT", "FLAGS.SILENT", "-FLAGS.SILENT").
+				storeItem := strings.ToUpper(parts[4])
+
+				// RFC 3501 §6.4.6: the .SILENT suffix suppresses the untagged
+				// FETCH response. Detect it before inspecting +/- modifiers.
+				silent := strings.Contains(storeItem, ".SILENT")
+
+				// Everything after the storeItem token is the flag list.
+				// Use the parsed parts rather than slicing the raw command line to
+				// avoid index mis-alignment on mixed-case input.
+				flagsPart := strings.Join(parts[5:], " ")
+				mask := parseFlagsMask(flagsPart)
+
+				isReplace := !strings.Contains(storeItem, "+") && !strings.Contains(storeItem, "-")
+				var flagsToSet uint32
+				var flagsToClear uint32
+				if isReplace {
+					flagsToSet = mask
+				} else if strings.Contains(storeItem, "+") {
+					flagsToSet = mask
+				} else {
+					flagsToClear = mask
+				}
+
+				// Use FetchMessageHeaders — UID STORE only needs UIDs and current
+				// flags, never message bodies. This avoids copying all payloads.
+				msgsList, err := s.db.FetchMessageHeaders(currentUser)
+				if err != nil {
+					writeLine(conn, []byte(fmt.Sprintf("%s NO Failed to read mailbox messages\r\n", tag)))
+					continue
+				}
+
+				var matchingUIDs []uint32
+				uidToSeq := make(map[uint32]int)
+				maxUID := highestUID(msgsList)
+				for i, msg := range msgsList {
+					if matchUID(msg.UID, maxUID, uidRange) {
+						matchingUIDs = append(matchingUIDs, msg.UID)
+						uidToSeq[msg.UID] = i + 1
+					}
+				}
+
+				if len(matchingUIDs) > 0 {
+					updatedFlags, err := s.db.UpdateMessagesFlags(currentUser, matchingUIDs, flagsToSet, flagsToClear, isReplace)
+					if err != nil {
+						writeLine(conn, []byte(fmt.Sprintf("%s NO Failed to update flags\r\n", tag)))
+						continue
+					}
+					// Only emit untagged FETCH responses when the client did NOT
+					// request silent mode (RFC 3501 §6.4.6).
+					if !silent {
+						for _, msg := range msgsList {
+							if newFlags, ok := updatedFlags[msg.UID]; ok {
+								flagsStr := formatFlags(newFlags)
+								writeLine(conn, []byte(fmt.Sprintf("* %d FETCH (UID %d FLAGS %s)\r\n", uidToSeq[msg.UID], msg.UID, flagsStr)))
+							}
+						}
+					}
+				}
+				writeLine(conn, []byte(fmt.Sprintf("%s OK UID STORE completed\r\n", tag)))
+			} else if subCmd == "EXPUNGE" {
+				// RFC 4315: UID EXPUNGE <uid-set> removes only messages that are
+				// both already \Deleted and whose UID is in the supplied set. It must
+				// not mark messages deleted, and it must not expunge other deleted UIDs.
+				if len(parts) < 4 {
+					writeLine(conn, []byte(fmt.Sprintf("%s BAD UID EXPUNGE missing uid-set\r\n", tag)))
+					continue
+				}
+				uidSet := parts[3]
+
+				msgsBefore, err := s.db.FetchMessageHeaders(currentUser)
+				if err != nil {
+					writeLine(conn, []byte(fmt.Sprintf("%s NO Failed to read mailbox\r\n", tag)))
+					continue
+				}
+
+				allowedUIDs := make(map[uint32]bool)
+				maxUID := highestUID(msgsBefore)
+				for _, msg := range msgsBefore {
+					if matchUID(msg.UID, maxUID, uidSet) {
+						allowedUIDs[msg.UID] = true
+					}
+				}
+
+				expungedUIDs, err := s.db.ExpungeSelectedDeletedMessages(currentUser, allowedUIDs)
+				if err != nil {
+					writeLine(conn, []byte(fmt.Sprintf("%s NO Expunge failed\r\n", tag)))
+					continue
+				}
+				expungedSet := make(map[uint32]bool, len(expungedUIDs))
+				for _, uid := range expungedUIDs {
+					expungedSet[uid] = true
+				}
+				// Emit sequence numbers in descending order (RFC 3501 §7.4.1).
+				var seqNums []int
+				for i, msg := range msgsBefore {
+					if expungedSet[msg.UID] {
+						seqNums = append(seqNums, i+1)
+					}
+				}
+				for i, j := 0, len(seqNums)-1; i < j; i, j = i+1, j-1 {
+					seqNums[i], seqNums[j] = seqNums[j], seqNums[i]
+				}
+				for _, seq := range seqNums {
+					writeLine(conn, []byte(fmt.Sprintf("* %d EXPUNGE\r\n", seq)))
+				}
+				writeLine(conn, []byte(fmt.Sprintf("%s OK UID EXPUNGE completed\r\n", tag)))
+			} else {
+				writeLine(conn, []byte(fmt.Sprintf("%s NO UID subcommand not implemented: %s\r\n", tag, subCmd)))
+			}
+
+		// RFC 3501 §6.4.6 — STORE <sequence-set> <message data item> <value>
+		// Sequence-number form: sequence numbers map to the ordered FetchMessages
+		// snapshot. Delegates to the same flag-update path as UID STORE.
+		case "STORE":
+			if !selected {
+				writeLine(conn, []byte(fmt.Sprintf("%s NO Select mailbox first\r\n", tag)))
+				continue
+			}
+			if len(parts) < 5 {
+				writeLine(conn, []byte(fmt.Sprintf("%s BAD STORE missing arguments\r\n", tag)))
+				continue
+			}
+			seqRange := parts[2]
+			storeItem := strings.ToUpper(parts[3])
+			silent := strings.Contains(storeItem, ".SILENT")
+			flagsPart := strings.Join(parts[4:], " ")
+			mask := parseFlagsMask(flagsPart)
+			isReplace := !strings.Contains(storeItem, "+") && !strings.Contains(storeItem, "-")
+			var flagsToSet, flagsToClear uint32
+			if isReplace {
+				flagsToSet = mask
+			} else if strings.Contains(storeItem, "+") {
+				flagsToSet = mask
+			} else {
+				flagsToClear = mask
+			}
+
+			msgsList, err := s.db.FetchMessageHeaders(currentUser)
+			if err != nil {
+				writeLine(conn, []byte(fmt.Sprintf("%s NO Failed to read mailbox\r\n", tag)))
+				continue
+			}
+			var matchingUIDs []uint32
+			seqToUID := make(map[uint32]int) // uid → seqNum
+			for i, msg := range msgsList {
+				sn := i + 1
+				if matchSeq(sn, len(msgsList), seqRange) {
+					matchingUIDs = append(matchingUIDs, msg.UID)
+					seqToUID[msg.UID] = sn
+				}
+			}
+			if len(matchingUIDs) > 0 {
+				updatedFlags, err := s.db.UpdateMessagesFlags(currentUser, matchingUIDs, flagsToSet, flagsToClear, isReplace)
+				if err != nil {
+					writeLine(conn, []byte(fmt.Sprintf("%s NO Failed to update flags\r\n", tag)))
+					continue
+				}
+				if !silent {
+					// Emit responses in stable mailbox sequence order. Iterating the
+					// updatedFlags map directly would randomise untagged FETCH order,
+					// which confuses strict clients tracking sequence-number changes.
+					for _, msg := range msgsList {
+						if newFlags, ok := updatedFlags[msg.UID]; ok {
+							flagsStr := formatFlags(newFlags)
+							writeLine(conn, []byte(fmt.Sprintf("* %d FETCH (UID %d FLAGS %s)\r\n", seqToUID[msg.UID], msg.UID, flagsStr)))
+						}
+					}
+				}
+			}
+			writeLine(conn, []byte(fmt.Sprintf("%s OK STORE completed\r\n", tag)))
+
+		// RFC 3501 §6.4.5 — FETCH <sequence-set> <data items>
+		// This is the mandatory sequence-number form. We map sequence numbers
+		// directly to the ordered FetchMessages snapshot (seq 1 = first message).
+		case "FETCH":
+			if !selected {
+				writeLine(conn, []byte(fmt.Sprintf("%s NO Select mailbox first\r\n", tag)))
+				continue
+			}
+			if len(parts) < 4 {
+				writeLine(conn, []byte(fmt.Sprintf("%s BAD FETCH missing arguments\r\n", tag)))
+				continue
+			}
+			seqRange := parts[2]
+			cmdUpper := strings.ToUpper(cmdLine)
+			wantBody := strings.Contains(cmdUpper, "BODY") || strings.Contains(cmdUpper, "RFC822")
+			var msgsList []database.DBMessage
+			var err error
+			if wantBody {
+				msgsList, err = s.db.FetchMessages(currentUser)
+			} else {
+				msgsList, err = s.db.FetchMessageHeaders(currentUser)
+			}
+			if err != nil {
+				writeLine(conn, []byte(fmt.Sprintf("%s NO Failed to read mailbox messages\r\n", tag)))
+				continue
+			}
+
+			for i, msg := range msgsList {
+				seqNum := i + 1
+				if !matchSeq(seqNum, len(msgsList), seqRange) {
+					continue
+				}
+				flagsStr := formatFlags(msg.Flags)
+				if wantBody {
+					// IMAP literals must advertise exactly the bytes that follow.
+					// Use the copied payload length rather than persisted metadata so
+					// corrupt rows cannot desynchronise strict clients.
+					literalSize := len(msg.Payload)
+					writeLine(conn, []byte(fmt.Sprintf("* %d FETCH (UID %d FLAGS %s BODY[] {%d}\r\n", seqNum, msg.UID, flagsStr, literalSize)))
+					writeLine(conn, msg.Payload)
+					// RFC 3501 §4.3: after the literal, exactly one CRLF before
+					// the closing ')' — avoid a double-blank-line when the
+					// payload already ends in \r\n, and ensure ')' is never
+					// appended to the last byte of a payload that lacks one.
+					if len(msg.Payload) == 0 || msg.Payload[len(msg.Payload)-1] != '\n' {
+						writeLine(conn, []byte("\r\n)\r\n"))
+					} else {
+						writeLine(conn, []byte(")\r\n"))
+					}
+				} else {
+					writeLine(conn, []byte(fmt.Sprintf("* %d FETCH (UID %d FLAGS %s)\r\n", seqNum, msg.UID, flagsStr)))
+				}
+			}
+			writeLine(conn, []byte(fmt.Sprintf("%s OK FETCH completed\r\n", tag)))
+
+		case "EXPUNGE":
+			if !selected {
+				writeLine(conn, []byte(fmt.Sprintf("%s NO Select mailbox first\r\n", tag)))
+				continue
+			}
+			expungedSeqNums, err := s.expungeAndReport(currentUser)
+			if err != nil {
+				writeLine(conn, []byte(fmt.Sprintf("%s NO Expunge failed\r\n", tag)))
+				continue
+			}
+			for _, seq := range expungedSeqNums {
+				writeLine(conn, []byte(fmt.Sprintf("* %d EXPUNGE\r\n", seq)))
+			}
+			writeLine(conn, []byte(fmt.Sprintf("%s OK EXPUNGE completed\r\n", tag)))
+
+		case "NOOP":
+			// RFC 3501 §6.1.2: server SHOULD send unsolicited mailbox status
+			// updates (EXISTS, RECENT) in response to any command when the
+			// mailbox has changed. Emit * N EXISTS so NOOP-polling clients
+			// (those that do not use IDLE) discover new mail reliably.
+			if selected {
+				if noopCount, _, _, noopErr := s.db.GetMailboxInfo(currentUser); noopErr == nil {
+					writeLine(conn, []byte(fmt.Sprintf("* %d EXISTS\r\n", noopCount)))
+				}
+			}
+			writeLine(conn, []byte(fmt.Sprintf("%s OK NOOP completed\r\n", tag)))
+
+		case "LIST":
+			if !authenticated {
+				writeLine(conn, []byte(fmt.Sprintf("%s NO Authenticate first\r\n", tag)))
+				continue
+			}
+			writeLine(conn, []byte("* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n"))
+			writeLine(conn, []byte(fmt.Sprintf("%s OK LIST completed\r\n", tag)))
+
+		case "LSUB":
+			if !authenticated {
+				writeLine(conn, []byte(fmt.Sprintf("%s NO Authenticate first\r\n", tag)))
+				continue
+			}
+			writeLine(conn, []byte("* LSUB () \"/\" \"INBOX\"\r\n"))
+			writeLine(conn, []byte(fmt.Sprintf("%s OK LSUB completed\r\n", tag)))
+
+		case "STATUS":
+			if !authenticated {
+				writeLine(conn, []byte(fmt.Sprintf("%s NO Authenticate first\r\n", tag)))
+				continue
+			}
+			// RFC 3501 §6.3.10: STATUS <mailbox> (<data items>)
+			// parts[2] = mailbox name, parts[3..] = requested data items.
+			// This server only supports INBOX; reject any other mailbox name.
+			if len(parts) < 4 {
+				writeLine(conn, []byte(fmt.Sprintf("%s BAD STATUS missing arguments\r\n", tag)))
+				continue
+			}
+			mailboxName := strings.ToUpper(parts[2])
+			if mailboxName != "INBOX" {
+				writeLine(conn, []byte(fmt.Sprintf("%s NO [NONEXISTENT] Mailbox does not exist\r\n", tag)))
+				continue
+			}
+
+			requestedItems := parseStatusItems(strings.Join(parts[3:], " "))
+			if len(requestedItems) == 0 {
+				writeLine(conn, []byte(fmt.Sprintf("%s BAD STATUS data item list is empty or malformed\r\n", tag)))
+				continue
+			}
+
+			count, uidValidity, nextUID, err := s.db.GetMailboxInfo(currentUser)
+			if err != nil {
+				writeLine(conn, []byte(fmt.Sprintf("%s NO STATUS failed\r\n", tag)))
+				continue
+			}
+			if uidValidity == 0 {
+				uidValidity = uint32(time.Now().Unix())
+			}
+			if nextUID == 0 {
+				nextUID = count + 1
+			}
+
+			var unseenCount uint32
+			if requestedItems["UNSEEN"] {
+				// UNSEEN must be the count of messages without \Seen (flag bit 0x01),
+				// not the total message count. FetchMessageHeaders avoids copying
+				// message payloads — only UID, Flags, and metadata are needed here.
+				allMsgs, fetchErr := s.db.FetchMessageHeaders(currentUser)
+				if fetchErr != nil {
+					writeLine(conn, []byte(fmt.Sprintf("%s NO STATUS failed\r\n", tag)))
+					continue
+				}
+				for _, m := range allMsgs {
+					if m.Flags&0x01 == 0 {
+						unseenCount++
+					}
+				}
+			}
+
+			var statusPairs []string
+			for _, item := range []string{"MESSAGES", "RECENT", "UIDNEXT", "UIDVALIDITY", "UNSEEN"} {
+				if !requestedItems[item] {
+					continue
+				}
+				switch item {
+				case "MESSAGES":
+					statusPairs = append(statusPairs, fmt.Sprintf("MESSAGES %d", count))
+				case "RECENT":
+					statusPairs = append(statusPairs, "RECENT 0")
+				case "UIDNEXT":
+					statusPairs = append(statusPairs, fmt.Sprintf("UIDNEXT %d", nextUID))
+				case "UIDVALIDITY":
+					statusPairs = append(statusPairs, fmt.Sprintf("UIDVALIDITY %d", uidValidity))
+				case "UNSEEN":
+					statusPairs = append(statusPairs, fmt.Sprintf("UNSEEN %d", unseenCount))
+				}
+			}
+			writeLine(conn, []byte(fmt.Sprintf("* STATUS INBOX (%s)\r\n", strings.Join(statusPairs, " "))))
+			writeLine(conn, []byte(fmt.Sprintf("%s OK STATUS completed\r\n", tag)))
+
+		case "CLOSE":
+			if !selected {
+				writeLine(conn, []byte(fmt.Sprintf("%s BAD No mailbox selected\r\n", tag)))
+				continue
+			}
+			// RFC 3501 §6.4.2: CLOSE must silently expunge \Deleted messages.
+			if _, err := s.db.ExpungeDeletedMessages(currentUser); err != nil {
+				writeLine(conn, []byte(fmt.Sprintf("%s NO CLOSE failed\r\n", tag)))
+				continue
+			}
+			selected = false
+			writeLine(conn, []byte(fmt.Sprintf("%s OK CLOSE completed\r\n", tag)))
+
+		case "LOGOUT":
+			// RFC 3501 §6.1.3: server sends untagged BYE, then tagged OK.
+			// Two distinct protocol lines — sent as separate writes for clarity
+			// and correct per-write deadline enforcement.
+			writeLine(conn, []byte("* BYE IMAP Server logging out\r\n"))
+			writeLine(conn, []byte(fmt.Sprintf("%s OK LOGOUT completed\r\n", tag)))
+			return
+
+		default:
+			writeLine(conn, []byte(fmt.Sprintf("%s BAD Unknown command\r\n", tag)))
 		}
-		data.NumDeleted = &n
 	}
-	return data, nil
 }
 
-func (s *session) List(w *imapserver.ListWriter, ref string, patterns []string, _ *imap.ListOptions) error {
-	if len(patterns) == 0 {
-		return w.WriteList(&imap.ListData{Attrs: []imap.MailboxAttr{imap.MailboxAttrNoSelect}, Delim: '/'})
+// authenticateUser validates credentials, enforces domain policy, and updates
+// session state. It writes the tagged response to conn and returns any error.
+// remoteAddr is included in log lines for abuse detection and audit purposes.
+func (s *Server) authenticateUser(tag, user, pass string, authenticated *bool, currentUser *string, conn net.Conn, remoteAddr string) error {
+	user = cleanAuthUsername(user)
+	if user == "" || !strings.HasSuffix(user, "@local.chat") {
+		writeLine(conn, []byte(fmt.Sprintf("%s NO [AUTHENTICATIONFAILED] Only well-formed @local.chat accounts are permitted\r\n", tag)))
+		log.Printf("IMAP auth rejected — malformed/non-local identity: user=%q remote=%s", user, remoteAddr)
+		return fmt.Errorf("identity rejected")
 	}
-	for _, pattern := range patterns {
-		if imapserver.MatchList(inbox, '/', ref, pattern) {
-			return w.WriteList(&imap.ListData{Mailbox: inbox, Delim: '/'})
+	err := s.db.AuthenticateOrRegister(user, pass)
+	if err != nil {
+		if errors.Is(err, database.ErrUserSuspended) {
+			writeLine(conn, []byte(fmt.Sprintf("%s NO [ALERT] Account suspended by administration\r\n", tag)))
+		} else {
+			writeLine(conn, []byte(fmt.Sprintf("%s NO [AUTHENTICATIONFAILED] Credentials invalid\r\n", tag)))
 		}
+		log.Printf("IMAP authentication failed: user=%q remote=%s err=%v", user, remoteAddr, err)
+		return err
 	}
+	*authenticated = true
+	*currentUser = user
+	log.Printf("IMAP authentication succeeded: user=%s remote=%s", user, remoteAddr)
+	writeLine(conn, []byte(fmt.Sprintf("%s OK LOGIN completed\r\n", tag)))
 	return nil
 }
 
-func (s *session) Append(mailbox string, r imap.LiteralReader, options *imap.AppendOptions) (*imap.AppendData, error) {
-	if !strings.EqualFold(mailbox, inbox) {
-		return nil, &imap.Error{
-			Type: imap.StatusResponseTypeNo,
-			Code: imap.ResponseCodeTryCreate,
-			Text: "No such mailbox",
-		}
-	}
-	var buf bytes.Buffer
-	if _, err := buf.ReadFrom(r); err != nil {
-		return nil, err
-	}
-	t := options.Time
-	if t.IsZero() {
-		t = time.Now()
-	}
-	uid, err := s.db.AppendMessage(s.user, buf.Bytes(), flagsToBitmask(options.Flags), t)
+// expungeAndReport fetches the pre-expunge snapshot, runs the expunge, and
+// returns the descending sequence numbers of the expunged messages as required
+// by RFC 3501 §7.4.1 (sequence numbers shift downward with each expunge).
+func (s *Server) expungeAndReport(username string) ([]int, error) {
+	// Snapshot message metadata before expunge to compute correct sequence numbers.
+	msgsBefore, err := s.db.FetchMessageHeaders(username)
 	if err != nil {
 		return nil, err
 	}
-	uidValid, _ := s.db.UIDValidity(s.user)
-	return &imap.AppendData{UID: imap.UID(uid), UIDValidity: uidValid}, nil
-}
-
-// ---------------------------------------------------------------------------
-// Selected state
-// ---------------------------------------------------------------------------
-
-func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *imap.FetchOptions) error {
-	markSeen := false
-	for _, bs := range options.BodySection {
-		if !bs.Peek {
-			markSeen = true
-			break
-		}
+	expungedUIDs, err := s.db.ExpungeDeletedMessages(username)
+	if err != nil {
+		return nil, err
 	}
 
-	for i, m := range s.msgs {
-		seqNum := uint32(i) + 1
-		if !contains(numSet, seqNum, m.UID, s.maxSeq(), s.maxUID()) {
-			continue
-		}
-		if markSeen && m.Flags&database.FlagSeen == 0 {
-			m.Flags |= database.FlagSeen
-			if err := s.db.SetFlags(s.user, m.UID, m.Flags); err != nil {
-				return err
-			}
-		}
-		rw := w.CreateMessage(seqNum)
-		if err := writeMessage(rw, m, options); err != nil {
-			return err
+	expungedSet := make(map[uint32]bool, len(expungedUIDs))
+	for _, uid := range expungedUIDs {
+		expungedSet[uid] = true
+	}
+
+	// Collect sequence numbers in forward order, then reverse before returning
+	// so that clients remove them from highest to lowest (RFC 3501 §7.4.1).
+	var seqNums []int
+	for i, msg := range msgsBefore {
+		if expungedSet[msg.UID] {
+			seqNums = append(seqNums, i+1)
 		}
 	}
-	return nil
+	// Reverse so we send highest sequence number first.
+	for i, j := 0, len(seqNums)-1; i < j; i, j = i+1, j-1 {
+		seqNums[i], seqNums[j] = seqNums[j], seqNums[i]
+	}
+	return seqNums, nil
 }
 
-func (s *session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *imap.StoreFlags, _ *imap.StoreOptions) error {
-	for i, m := range s.msgs {
-		seqNum := uint32(i) + 1
-		if !contains(numSet, seqNum, m.UID, s.maxSeq(), s.maxUID()) {
-			continue
+// cleanAuthUsername validates the mailbox identity used for IMAP LOGIN and
+// AUTHENTICATE. Auto-registration is intentionally limited to syntactically
+// well-formed local.chat mailboxes to prevent malformed accounts such as
+// "@local.chat" or "alice@@local.chat" from being created through auth paths.
+func cleanAuthUsername(username string) string {
+	if strings.ContainsAny(username, "\r\n\t") {
+		return ""
+	}
+	username = strings.ToLower(strings.TrimSpace(username))
+	if username == "" || strings.Contains(username, " ") {
+		return ""
+	}
+	if strings.Count(username, "@") != 1 {
+		return ""
+	}
+	parts := strings.SplitN(username, "@", 2)
+	if parts[0] == "" || parts[1] == "" {
+		return ""
+	}
+	return username
+}
+
+// decodePlainAuth decodes a base64-encoded SASL PLAIN token of the form:
+// [authzid NUL] authcid NUL passwd  (RFC 4616)
+func decodePlainAuth(encoded string) (user, pass string, ok bool) {
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		// Some clients omit padding; try RawStdEncoding as a fallback.
+		decoded, err = base64.RawStdEncoding.DecodeString(encoded)
+		if err != nil {
+			return "", "", false
 		}
-		m.Flags = applyStore(m.Flags, flags)
-		if err := s.db.SetFlags(s.user, m.UID, m.Flags); err != nil {
-			return err
-		}
 	}
-	if flags.Silent {
-		return nil
+	if len(decoded) < 2 {
+		return "", "", false
 	}
-	// Emit updated FLAGS for matched messages via a FETCH response.
-	return s.Fetch(w, numSet, &imap.FetchOptions{Flags: true})
+	// Split on NUL bytes: [authzid \x00 authcid \x00 passwd]
+	parts := strings.SplitN(string(decoded), "\x00", 3)
+	if len(parts) != 3 {
+		return "", "", false
+	}
+	// parts[0] = authzid (ignored), parts[1] = username, parts[2] = password
+	return parts[1], parts[2], true
 }
 
-// Expunge removes messages flagged \Deleted. If uids is non-nil (UID EXPUNGE),
-// only the intersection of flagged messages and uids is removed. Responses are
-// emitted in descending sequence order so the client's remaining sequence
-// numbers stay valid as the list shrinks.
-func (s *session) Expunge(w *imapserver.ExpungeWriter, uids *imap.UIDSet) error {
-	for i := len(s.msgs) - 1; i >= 0; i-- {
-		m := s.msgs[i]
-		if uids != nil && !uids.Contains(imap.UID(m.UID)) {
-			continue
-		}
-		if m.Flags&database.FlagDeleted == 0 {
-			continue
-		}
-		if err := s.db.DeleteMessage(s.user, m.UID); err != nil {
-			return err
-		}
-		if err := w.WriteExpunge(uint32(i) + 1); err != nil {
-			return err
-		}
-	}
-	return s.reload()
-}
-
-// Search implements the criteria subset needed by DeltaChat:
-// sequence/UID sets, system flags, and date windows.
-func (s *session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria, _ *imap.SearchOptions) (*imap.SearchData, error) {
-	var (
-		data   imap.SearchData
-		seqSet imap.SeqSet
-		uidSet imap.UIDSet
-	)
-	for i, m := range s.msgs {
-		seqNum := uint32(i) + 1
-		if !matchSearch(m, seqNum, criteria, s.maxSeq(), s.maxUID()) {
-			continue
-		}
-		var num uint32
-		switch kind {
-		case imapserver.NumKindSeq:
-			seqSet.AddNum(seqNum)
-			num = seqNum
-		case imapserver.NumKindUID:
-			uidSet.AddNum(imap.UID(m.UID))
-			num = m.UID
-		}
-		if data.Min == 0 || num < data.Min {
-			data.Min = num
-		}
-		if num > data.Max {
-			data.Max = num
-		}
-		data.Count++
-	}
-	if kind == imapserver.NumKindUID {
-		data.All = uidSet
-	} else {
-		data.All = seqSet
-	}
-	return &data, nil
-}
-
-// Poll is called by the framework for unsolicited updates (new EXISTS, EXPUNGE
-// from another session). We do not maintain cross-session state, so this is a
-// no-op.
-func (s *session) Poll(_ *imapserver.UpdateWriter, _ bool) error { return nil }
-
-// Idle blocks until the client terminates the IDLE command. New mail is not
-// pushed; clients observe it by re-SELECTing after DONE.
-func (s *session) Idle(_ *imapserver.UpdateWriter, stop <-chan struct{}) error {
-	<-stop
-	return nil
-}
-
-// ---------------------------------------------------------------------------
-// Unsupported mutating operations on the fixed INBOX-only namespace
-// ---------------------------------------------------------------------------
-
-func (s *session) Create(string, *imap.CreateOptions) error {
-	return &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Mailbox creation is not supported"}
-}
-func (s *session) Delete(string) error {
-	return &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Mailbox deletion is not supported"}
-}
-func (s *session) Rename(string, string, *imap.RenameOptions) error {
-	return &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Mailbox rename is not supported"}
-}
-func (s *session) Subscribe(string) error   { return nil }
-func (s *session) Unsubscribe(string) error { return nil }
-func (s *session) Copy(imap.NumSet, string) (*imap.CopyData, error) {
-	return nil, &imap.Error{
-		Type: imap.StatusResponseTypeNo,
-		Code: imap.ResponseCodeTryCreate,
-		Text: "No such mailbox",
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-func (s *session) reload() error {
-	msgs, err := s.db.LoadMessages(s.user)
-	if err != nil && err != database.ErrNoMailbox {
-		return err
-	}
-	s.msgs = msgs
-	if s.uidNext, err = s.db.NextUID(s.user); err != nil && err != database.ErrNoMailbox {
-		return err
-	}
-	if s.uidValid, err = s.db.UIDValidity(s.user); err != nil && err != database.ErrNoMailbox {
-		return err
-	}
-	return nil
-}
-
-func (s *session) maxSeq() uint32 { return uint32(len(s.msgs)) }
-
-func (s *session) maxUID() uint32 {
-	if len(s.msgs) == 0 {
-		return 0
-	}
-	return s.msgs[len(s.msgs)-1].UID
-}
-
-// ---------------------------------------------------------------------------
-// NumSet matching
-// ---------------------------------------------------------------------------
-
-// contains reports whether a message at (seqNum, uid) is selected by numSet.
-// Dynamic "*" boundaries are resolved against the current mailbox maxima.
-func contains(numSet imap.NumSet, seqNum, uid, maxSeq, maxUID uint32) bool {
-	switch set := numSet.(type) {
-	case imap.SeqSet:
-		return rangeContains(resolveSeqSet(set, maxSeq), seqNum)
-	case imap.UIDSet:
-		return rangeContains(resolveUIDSet(set, maxUID), uid)
-	default:
-		return false
-	}
-}
-
-func rangeContains(ranges [][2]uint32, n uint32) bool {
-	for _, r := range ranges {
-		if n >= r[0] && n <= r[1] {
+// matchSeq reports whether seqNum (1-based) is within the given RFC 3501
+// sequence-set string. Sequence-sets may be comma-separated lists of numbers
+// and ranges, e.g. "1,3,5:7,*". "*" means the last message (totalMsgs).
+func matchSeq(seqNum, totalMsgs int, seqSet string) bool {
+	for _, part := range strings.Split(seqSet, ",") {
+		part = strings.TrimSpace(part)
+		if matchSeqPart(seqNum, totalMsgs, part) {
 			return true
 		}
 	}
 	return false
 }
 
-func resolveSeqSet(set imap.SeqSet, max uint32) [][2]uint32 {
-	out := make([][2]uint32, 0, len(set))
-	for _, r := range set {
-		out = append(out, resolveRange(r.Start, r.Stop, max))
+func matchSeqPart(seqNum, totalMsgs int, part string) bool {
+	resolveSeq := func(s string) int {
+		if s == "*" {
+			return totalMsgs
+		}
+		var v int
+		if _, err := fmt.Sscanf(s, "%d", &v); err != nil {
+			return -1
+		}
+		return v
 	}
-	return out
+	if !strings.Contains(part, ":") {
+		return seqNum == resolveSeq(part)
+	}
+	rangeParts := strings.SplitN(part, ":", 2)
+	lo := resolveSeq(rangeParts[0])
+	hi := resolveSeq(rangeParts[1])
+	if lo > hi {
+		lo, hi = hi, lo // RFC 3501 §9: n:m is valid even when n > m
+	}
+	return seqNum >= lo && seqNum <= hi
 }
 
-func resolveUIDSet(set imap.UIDSet, max uint32) [][2]uint32 {
-	out := make([][2]uint32, 0, len(set))
-	for _, r := range set {
-		out = append(out, resolveRange(uint32(r.Start), uint32(r.Stop), max))
+func highestUID(msgs []database.DBMessage) uint32 {
+	var maxUID uint32
+	for _, msg := range msgs {
+		if msg.UID > maxUID {
+			maxUID = msg.UID
+		}
 	}
-	return out
+	return maxUID
 }
 
-// resolveRange converts a possibly-dynamic IMAP range [start,stop] (where 0
-// means "*" = the highest existing num) into a concrete [lo, hi] pair.
-func resolveRange(start, stop, max uint32) [2]uint32 {
-	if start == 0 {
-		start = max
+// matchUID reports whether uid is within the given RFC 3501 UID set string.
+// UID sets use the same comma/range syntax as sequence sets, but "*" means the
+// highest UID currently in the mailbox snapshot, not "all UIDs". Passing maxUID
+// keeps wildcard handling RFC-correct for FETCH/STORE/EXPUNGE snapshots.
+func matchUID(uid, maxUID uint32, seqSet string) bool {
+	for _, part := range strings.Split(seqSet, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if matchUIDPart(uid, maxUID, part) {
+			return true
+		}
 	}
-	if stop == 0 {
-		stop = max
-	}
-	if start > stop {
-		start, stop = stop, start
-	}
-	return [2]uint32{start, stop}
+	return false
 }
 
-// ---------------------------------------------------------------------------
-// Flag conversion
-// ---------------------------------------------------------------------------
+func matchUIDPart(uid, maxUID uint32, part string) bool {
+	resolveUID := func(s string) (uint32, bool) {
+		if s == "*" {
+			return maxUID, maxUID != 0
+		}
+		var val uint32
+		if _, err := fmt.Sscanf(s, "%d", &val); err != nil {
+			return 0, false
+		}
+		return val, true
+	}
 
-// systemFlagBits maps the five system flags to their bitmask values.
-var systemFlagBits = []struct {
-	flag imap.Flag
-	bit  uint32
-}{
-	{imap.FlagSeen, database.FlagSeen},
-	{imap.FlagAnswered, database.FlagAnswered},
-	{imap.FlagFlagged, database.FlagFlagged},
-	{imap.FlagDeleted, database.FlagDeleted},
-	{imap.FlagDraft, database.FlagDraft},
+	if !strings.Contains(part, ":") {
+		val, ok := resolveUID(part)
+		return ok && uid == val
+	}
+	rangeParts := strings.SplitN(part, ":", 2)
+	if len(rangeParts) != 2 {
+		return false
+	}
+	start, ok := resolveUID(rangeParts[0])
+	if !ok {
+		return false
+	}
+	end, ok := resolveUID(rangeParts[1])
+	if !ok {
+		return false
+	}
+	if start > end {
+		start, end = end, start
+	}
+	return uid >= start && uid <= end
 }
 
-func flagsToBitmask(flags []imap.Flag) uint32 {
-	var b uint32
-	for _, f := range flags {
-		for _, sf := range systemFlagBits {
-			if strings.EqualFold(string(f), string(sf.flag)) {
-				b |= sf.bit
+func parseStatusItems(raw string) map[string]bool {
+	raw = strings.TrimSpace(raw)
+	raw = strings.TrimPrefix(raw, "(")
+	raw = strings.TrimSuffix(raw, ")")
+	items := make(map[string]bool)
+	for _, field := range strings.Fields(raw) {
+		switch strings.ToUpper(field) {
+		case "MESSAGES", "RECENT", "UIDNEXT", "UIDVALIDITY", "UNSEEN":
+			items[strings.ToUpper(field)] = true
+		}
+	}
+	return items
+}
+
+func formatFlags(flags uint32) string {
+	var list []string
+	if flags&0x01 != 0 {
+		list = append(list, "\\Seen")
+	}
+	if flags&0x02 != 0 {
+		list = append(list, "\\Answered")
+	}
+	if flags&0x04 != 0 {
+		list = append(list, "\\Flagged")
+	}
+	if flags&0x08 != 0 {
+		list = append(list, "\\Deleted")
+	}
+	if flags&0x10 != 0 {
+		list = append(list, "\\Draft")
+	}
+	return "(" + strings.Join(list, " ") + ")"
+}
+
+func parseFlagsMask(s string) uint32 {
+	var mask uint32
+	upper := strings.ToUpper(s)
+	if strings.Contains(upper, "\\SEEN") {
+		mask |= 0x01
+	}
+	if strings.Contains(upper, "\\ANSWERED") {
+		mask |= 0x02
+	}
+	if strings.Contains(upper, "\\FLAGGED") {
+		mask |= 0x04
+	}
+	if strings.Contains(upper, "\\DELETED") {
+		mask |= 0x08
+	}
+	if strings.Contains(upper, "\\DRAFT") {
+		mask |= 0x10
+	}
+	return mask
+}
+
+// parseIMAPLine splits an IMAP command line into tokens, honouring double-quoted
+// strings and parenthesised groups. Outside quoted strings, backslash is treated
+// as a literal character because IMAP flag names like \Seen must be preserved.
+// Inside quoted strings, only RFC 3501 quoted-pair escapes for DQUOTE and
+// backslash are unescaped; other backslashes are preserved defensively.
+func parseIMAPLine(line string) []string {
+	var parts []string
+	var current strings.Builder
+	inQuote := false
+	parenDepth := 0
+
+	flush := func() {
+		if current.Len() > 0 {
+			parts = append(parts, current.String())
+			current.Reset()
+		}
+	}
+
+	for i := 0; i < len(line); i++ {
+		r := line[i]
+
+		if inQuote {
+			// RFC 3501 quoted strings use backslash to escape DQUOTE and
+			// backslash. Preserve non-standard backslash sequences literally instead
+			// of silently dropping the backslash from a password/mailbox name.
+			if r == '\\' && i+1 < len(line) {
+				next := line[i+1]
+				if next == '\\' || next == '"' {
+					i++
+					current.WriteByte(next)
+					continue
+				}
+			}
+			if r == '"' {
+				inQuote = false
+				continue
+			}
+			current.WriteByte(r)
+			continue
+		}
+
+		switch r {
+		case '"':
+			inQuote = true
+			continue
+		case '(':
+			parenDepth++
+		case ')':
+			if parenDepth > 0 {
+				parenDepth--
+			}
+		case ' ':
+			if parenDepth == 0 {
+				flush()
+				continue
 			}
 		}
+		current.WriteByte(r)
 	}
-	return b
-}
-
-func bitmaskToFlags(b uint32) []imap.Flag {
-	var flags []imap.Flag
-	for _, sf := range systemFlagBits {
-		if b&sf.bit != 0 {
-			flags = append(flags, sf.flag)
-		}
-	}
-	return flags
-}
-
-func definedFlags() []imap.Flag {
-	return []imap.Flag{imap.FlagSeen, imap.FlagAnswered, imap.FlagFlagged, imap.FlagDeleted, imap.FlagDraft}
-}
-
-func applyStore(cur uint32, store *imap.StoreFlags) uint32 {
-	mask := flagsToBitmask(store.Flags)
-	switch store.Op {
-	case imap.StoreFlagsSet:
-		return mask
-	case imap.StoreFlagsAdd:
-		return cur | mask
-	case imap.StoreFlagsDel:
-		return cur &^ mask
-	default:
-		return cur
-	}
-}
-
-// ---------------------------------------------------------------------------
-// FETCH response assembly
-// ---------------------------------------------------------------------------
-
-// writeMessage emits a single FETCH response. Body section extraction and MIME
-// structure parsing are delegated to the imapserver framework helpers so the
-// implementation stays protocol-correct for nested multipart messages.
-func writeMessage(w *imapserver.FetchResponseWriter, m *database.Message, options *imap.FetchOptions) error {
-	w.WriteUID(imap.UID(m.UID))
-
-	if options.Flags {
-		w.WriteFlags(bitmaskToFlags(m.Flags))
-	}
-	if options.InternalDate {
-		w.WriteInternalDate(time.Unix(m.InternalDate, 0))
-	}
-	if options.RFC822Size {
-		w.WriteRFC822Size(int64(len(m.Body)))
-	}
-	if options.Envelope {
-		w.WriteEnvelope(extractEnvelope(m.Body))
-	}
-	if options.BodyStructure != nil {
-		w.WriteBodyStructure(imapserver.ExtractBodyStructure(bytes.NewReader(m.Body)))
-	}
-
-	for _, bs := range options.BodySection {
-		buf := imapserver.ExtractBodySection(bytes.NewReader(m.Body), bs)
-		wc := w.WriteBodySection(bs, int64(len(buf)))
-		_, writeErr := wc.Write(buf)
-		closeErr := wc.Close()
-		if writeErr != nil {
-			return writeErr
-		}
-		if closeErr != nil {
-			return closeErr
-		}
-	}
-
-	for _, bs := range options.BinarySection {
-		buf := imapserver.ExtractBinarySection(bytes.NewReader(m.Body), bs)
-		wc := w.WriteBinarySection(bs, int64(len(buf)))
-		_, writeErr := wc.Write(buf)
-		closeErr := wc.Close()
-		if writeErr != nil {
-			return writeErr
-		}
-		if closeErr != nil {
-			return closeErr
-		}
-	}
-
-	for _, bss := range options.BinarySectionSize {
-		n := imapserver.ExtractBinarySectionSize(bytes.NewReader(m.Body), bss)
-		w.WriteBinarySectionSize(bss, n)
-	}
-
-	return w.Close()
-}
-
-func extractEnvelope(body []byte) *imap.Envelope {
-	br := bufio.NewReader(bytes.NewReader(body))
-	header, err := textproto.ReadHeader(br)
-	if err != nil {
-		return nil
-	}
-	return imapserver.ExtractEnvelope(header)
-}
-
-// ---------------------------------------------------------------------------
-// SEARCH criteria matching
-// ---------------------------------------------------------------------------
-
-// matchSearch evaluates the DeltaChat-relevant SEARCH criteria subset:
-// sequence/UID set membership, system flags, and date windows.
-//
-// Text, header, and body searches are not implemented (they would require
-// full-text indexing). Unrecognised criteria cause the message to be excluded.
-func matchSearch(m *database.Message, seqNum uint32, criteria *imap.SearchCriteria, maxSeq, maxUID uint32) bool {
-	for _, set := range criteria.SeqNum {
-		if !rangeContains(resolveSeqSet(set, maxSeq), seqNum) {
-			return false
-		}
-	}
-	for _, set := range criteria.UID {
-		if !rangeContains(resolveUIDSet(set, maxUID), m.UID) {
-			return false
-		}
-	}
-	for _, f := range criteria.Flag {
-		if m.Flags&flagsToBitmask([]imap.Flag{f}) == 0 {
-			return false
-		}
-	}
-	for _, f := range criteria.NotFlag {
-		if m.Flags&flagsToBitmask([]imap.Flag{f}) != 0 {
-			return false
-		}
-	}
-	t := time.Unix(m.InternalDate, 0)
-	if !criteria.Since.IsZero() && t.Before(criteria.Since) {
-		return false
-	}
-	if !criteria.Before.IsZero() && !t.Before(criteria.Before) {
-		return false
-	}
-	return true
+	flush()
+	return parts
 }

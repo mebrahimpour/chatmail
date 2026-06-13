@@ -1,0 +1,38 @@
+[Unit]
+Description=Minimal Chatmail Server (Go SMTP/IMAP Platform)
+After=network.target stunnel4.service
+Wants=stunnel4.service
+
+[Service]
+Type=simple
+User=chatmail
+Group=chatmail
+WorkingDirectory=/var/lib/chatmail
+ExecStart=/usr/local/bin/chatmail-core
+
+# Storage configuration (Air-gapped safety directory write allowance)
+StateDirectory=chatmail
+RuntimeDirectory=chatmail
+
+# Security Profile Sandbox Regulations
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/
+ReadWritePaths=/var/lib/chatmail/
+
+# Device Isolation Layer Restrictions
+PrivateTmp=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Kernel System Call & Privilege Isolation Policies
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+
+# Sandbox resource limits to prevent SD Card / CPU exhaustions
+CPUQuota=40%
+MemoryMax=150M
+
+[Install]
+WantedBy=multi-user.target
